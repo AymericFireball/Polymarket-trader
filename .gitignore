@@ -1,0 +1,55 @@
+# ── Secrets & credentials ──────────────────────────────────────
+# NEVER commit your private key, API keys, or wallet credentials.
+# Fill these in config.py locally — do not push config.py if you add real keys.
+.env
+.env.local
+.env.production
+.env.staging
+!.env.example
+secrets.py
+credentials.json
+
+# ── Database ────────────────────────────────────────────────────
+# The SQLite DB is local state — not shared via git.
+# Each user initializes their own with: python run.py status
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# ── Python cache ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── OS & editor ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Temp / output files ─────────────────────────────────────────
+# JSON scan results and imported data are local
+scan_results.json
+market_data.json
+fresh_markets.json
+resolved_markets*.csv
+*.log
+
+# ── MiroFish (cloned separately) ────────────────────────────────
+MiroFish/

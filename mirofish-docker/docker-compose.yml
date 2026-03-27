@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  mirofish-backend:
+    image: mirofish:latest
+    platform: linux/amd64
+    ports:
+      - "5001:5001"
+    environment:
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      ZEP_API_KEY: ${ZEP_API_KEY}
+    volumes:
+      - mirofish_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mirofish-ui:
+    image: mirofish-ui:latest
+    platform: linux/amd64
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mirofish-backend
+    environment:
+      REACT_APP_API_URL: http://localhost:5001
+
+volumes:
+  mirofish_data:

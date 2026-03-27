@@ -1,0 +1,18 @@
+# Polymarket Trading Agent — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies (required)
+requests>=2.31.0              # HTTP requests to Polymarket APIs
+
+# Signal sources (optional but recommended)
+newsapi-python>=2.0.0         # News sentiment signal (requires free NewsAPI key)
+
+# Optional: For advanced features
+# Uncomment below if you enable MiroFish integration:
+# aiohttp>=3.9.0              # Async HTTP for MiroFish API calls
+# pydantic>=2.0.0             # Data validation
+
+# Development (optional)
+# pytest>=7.4.0               # Unit testing
+# black>=23.0.0               # Code formatting
+# pylint>=3.0.0               # Linting
