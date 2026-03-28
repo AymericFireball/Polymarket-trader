@@ -34,7 +34,10 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from db import init_db, get_conn, db_stats
-from config import BANKROLL, NEWSAPI_KEY
+from config import (
+    BANKROLL, NEWSAPI_KEY, BLACKLIST_KEYWORDS,
+    TIME_HORIZON_EDGE, TIME_HORIZON_CAPITAL_PCT,
+)
 try:
     from config import MIROFISH_API_URL
 except ImportError:
@@ -127,11 +130,35 @@ def cmd_scan(args):
         print("  python run.py import <file.json>")
         return
 
+    # Apply blacklist filter
+    filtered = []
+    rejected = 0
+    for row in markets:
+        q = (row["question"] or "").lower()
+        if any(kw in q for kw in BLACKLIST_KEYWORDS):
+            rejected += 1
+            continue
+        filtered.append(row)
+    markets = filtered
+
+    if rejected:
+        print(f"  Filtered out {rejected} blacklisted market(s)")
+
     print(f"Scanning top {len(markets)} markets...\n")
 
     results = []
     for row in markets:
         market = dict(row)
+
+        # Tag time horizon for edge threshold
+        from scanner import MarketScanner
+        dtl = MarketScanner.classify_time_horizon(
+            (datetime.fromisoformat(market["end_date"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).days
+            if market.get("end_date") else None
+        )
+        market["_time_horizon"] = dtl
+        market["_min_edge_cents"] = TIME_HORIZON_EDGE.get(dtl, 5)
+
         try:
             # Use market price as base, let signals adjust
             result = pipeline.analyze_market(market)
@@ -649,10 +676,17 @@ def cmd_paper_trade(args):
     from paper_trader import run_paper_session, paper_report
     top_n   = getattr(args, "top",     20)
     verbose = getattr(args, "verbose", False)
+    market  = getattr(args, "market",  None)
+    amount  = getattr(args, "amount",  None)
 
-    print(f"Paper-trading session — scanning top {top_n} markets...")
+    if market:
+        print(f"Paper trade — targeting market: {market}" +
+              (f" | ${amount:.2f}" if amount else ""))
+    else:
+        print(f"Paper-trading session — scanning top {top_n} markets...")
     print()
-    stats = run_paper_session(top_n=top_n, verbose=verbose)
+    stats = run_paper_session(top_n=top_n, verbose=verbose,
+                              market_keyword=market, amount=amount)
     print(f"\nScanned: {stats['scanned']}  |  Signals: {stats['signals']}  |  Recorded: {stats['recorded']}")
     print()
     print(paper_report(verbose=verbose))
@@ -663,6 +697,16 @@ def cmd_paper_report(args):
     from paper_trader import paper_report
     verbose = getattr(args, "verbose", False)
     print(paper_report(verbose=verbose))
+
+
+def cmd_dashboard(args):
+    """Launch the trading terminal dashboard."""
+    from dashboard import Dashboard
+    dash = Dashboard()
+    try:
+        dash.render()
+    finally:
+        dash.close()
 
 
 def cmd_fetch(args):
@@ -828,12 +872,17 @@ Examples:
 
     # paper-trade
     pt_p = subs.add_parser("paper-trade", help="Simulated trading session (no real orders)")
-    pt_p.add_argument("--top",     type=int, default=20, help="Markets to scan (default: 20)")
-    pt_p.add_argument("--verbose", action="store_true",  help="Print per-market details")
+    pt_p.add_argument("--top",     type=int,   default=20,  help="Markets to scan (default: 20)")
+    pt_p.add_argument("--market",  type=str,   default=None, help="Target a specific market (keyword or condition ID)")
+    pt_p.add_argument("--amount",  type=float, default=None, help="Override position size in USDC")
+    pt_p.add_argument("--verbose", action="store_true",      help="Print per-market details")
 
     # paper-report
     pr_p = subs.add_parser("paper-report", help="Paper-trading performance report")
     pr_p.add_argument("--verbose", action="store_true", help="Show individual trade details")
+
+    # dashboard
+    subs.add_parser("dashboard", help="Trading terminal dashboard")
 
     args = parser.parse_args()
 
@@ -856,6 +905,7 @@ Examples:
         "tune-weights": cmd_tune_weights,
         "paper-trade": cmd_paper_trade,
         "paper-report": cmd_paper_report,
+        "dashboard": cmd_dashboard,
     }
 
     if args.command in commands:
