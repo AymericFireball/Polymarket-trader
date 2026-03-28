@@ -5,7 +5,7 @@
 requests>=2.31.0              # HTTP requests to Polymarket APIs
 
 # Signal sources (optional but recommended)
-newsapi-python>=2.0.0         # News sentiment signal (requires free NewsAPI key)
+newsapi-python>=0.2.6         # News sentiment signal (requires free NewsAPI key)
 
 # Optional: For advanced features
 # Uncomment below if you enable MiroFish integration:

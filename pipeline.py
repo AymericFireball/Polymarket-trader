@@ -218,6 +218,8 @@ class Pipeline:
             require_sharp_agreement=True,
             min_confidence="medium",
         )
+        from signal_fusion import SignalFusionEngine
+        self._fusion = SignalFusionEngine()
 
     def analyze_market(self, market: Dict,
                        my_probability: float = None,
@@ -263,22 +265,25 @@ class Pipeline:
                 for k, v in signals.items()
             }
 
-        # ── Stage 3: Preprocessing ──
+        # ── Stage 3: Preprocessing (signal fusion) ──
         if signals:
-            from preprocessor import preprocess_signals
-            bundle = preprocess_signals(signals)
+            bundle = self._fusion.fuse(signals, market_type, market_price=market_price)
             result["stages"]["preprocessing"] = {
                 "aggregate_score": bundle.get("aggregate_score"),
                 "confidence": bundle.get("confidence"),
+                "confidence_score": bundle.get("confidence_score"),
                 "contradictions": bundle.get("contradictions", []),
                 "signal_count": bundle.get("signal_count"),
+                "profile_used": bundle.get("profile_used"),
             }
         else:
             bundle = {
                 "signals": {},
                 "aggregate_score": 0,
                 "confidence": "medium" if my_probability else "low",
+                "confidence_score": 0.5 if my_probability else 0.2,
                 "contradictions": [],
+                "fused_probability": None,
             }
 
         # ── Stage 4: MiroFish (optional) ──
@@ -291,20 +296,22 @@ class Pipeline:
                 "confidence": mirofish_result.get("confidence"),
                 "dissent_flag": mirofish_result.get("dissent_flag"),
             }
+            # Re-fuse with MiroFish result for adaptive blending
+            if signals and mirofish_result.get("sim_probability") is not None:
+                bundle = self._fusion.fuse(
+                    signals, market_type,
+                    mirofish_result=mirofish_result,
+                    market_price=market_price,
+                )
+                result["stages"]["mirofish"]["blend_ratio"] = bundle.get("mirofish_blend_ratio")
+                result["stages"]["mirofish"]["strong_disagreement"] = bundle.get("strong_disagreement")
 
         # ── Compute raw probability ──
         if my_probability is not None:
             raw_prob = my_probability
-        elif mirofish_result and mirofish_result.get("sim_probability"):
-            # Blend MiroFish with signal aggregate
-            sim_p = mirofish_result["sim_probability"]
-            agg_score = bundle.get("aggregate_score", 0)
-            signal_p = market_price + agg_score * 0.15  # Signal adjustment
-            signal_p = max(0.01, min(0.99, signal_p))
-            # 60% MiroFish, 40% signal-adjusted
-            raw_prob = 0.6 * sim_p + 0.4 * signal_p
+        elif bundle.get("fused_probability") is not None:
+            raw_prob = bundle["fused_probability"]
         else:
-            # Use signal aggregate to adjust market price
             agg_score = bundle.get("aggregate_score", 0)
             raw_prob = market_price + agg_score * 0.15
             raw_prob = max(0.01, min(0.99, raw_prob))
@@ -330,6 +337,7 @@ class Pipeline:
             market, calibrated, bundle, risk_check
         )
         result["decision"] = gate_result
+        result["confidence_score"] = bundle.get("confidence_score", 0.5)
 
         # Record prediction for calibration tracking
         if gate_result.get("pass"):
