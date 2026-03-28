@@ -1,420 +1,453 @@
 #!/usr/bin/env python3
 """
-Polymarket Trading Terminal — Dashboard
-=========================================
-A slick terminal UI for monitoring your trading agent.
+Polymarket Trading Terminal — Textual + Rich Dashboard
+========================================================
+Live-updating TUI. Textual handles layout/keybindings; Rich renders panels.
 
 Usage:
-    python dashboard.py              # Full dashboard
-    python run.py dashboard          # Via main runner
+    python dashboard.py
+    python run.py dashboard
+
+Keybindings:
+    r  — refresh all panels
+    s  — run scan (background)
+    f  — fetch market data (background)
+    p  — run paper-trade session (background)
+    q  — quit
 """
 
+from __future__ import annotations
+
 import os
-import sys
-from datetime import datetime, timezone, timedelta
-from db import get_conn, init_db, db_stats
+import subprocess
+from datetime import datetime, timezone
 
-# ─── ANSI Color Codes ────────────────────────────────────────────
-class C:
-    """Terminal colors and styles."""
-    RESET      = "\033[0m"
-    BOLD       = "\033[1m"
-    DIM        = "\033[2m"
-    UNDERLINE  = "\033[4m"
-    BLINK      = "\033[5m"
+from textual.app import App, ComposeResult
+from textual.widgets import Static, Header
+from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.binding import Binding
+from textual import work
 
-    # Foreground
-    BLACK      = "\033[30m"
-    RED        = "\033[31m"
-    GREEN      = "\033[32m"
-    YELLOW     = "\033[33m"
-    BLUE       = "\033[34m"
-    MAGENTA    = "\033[35m"
-    CYAN       = "\033[36m"
-    WHITE      = "\033[37m"
-
-    # Bright foreground
-    BRED       = "\033[91m"
-    BGREEN     = "\033[92m"
-    BYELLOW    = "\033[93m"
-    BBLUE      = "\033[94m"
-    BMAGENTA   = "\033[95m"
-    BCYAN      = "\033[96m"
-    BWHITE     = "\033[97m"
-
-    # Background
-    BG_BLACK   = "\033[40m"
-    BG_RED     = "\033[41m"
-    BG_GREEN   = "\033[42m"
-    BG_YELLOW  = "\033[43m"
-    BG_BLUE    = "\033[44m"
-    BG_MAGENTA = "\033[45m"
-    BG_CYAN    = "\033[46m"
-    BG_WHITE   = "\033[47m"
-    BG_GRAY    = "\033[100m"
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.console import Group
+from rich import box
 
 
-def pnl_color(val):
-    """Return green for positive, red for negative, dim for zero."""
-    if val > 0:
-        return C.BGREEN
-    elif val < 0:
-        return C.BRED
-    return C.DIM
+# ─── DB helper (opens fresh connection each call to avoid thread issues) ──────
+
+def _db():
+    from db import get_conn, init_db
+    init_db()
+    return get_conn()
 
 
-def pnl_str(val):
-    """Format P&L with color and sign."""
-    color = pnl_color(val)
+# ─── Rendering helpers ────────────────────────────────────────────────────────
+
+def _pnl(val: float) -> Text:
     sign = "+" if val > 0 else ""
-    return f"{color}{sign}${val:.2f}{C.RESET}"
+    style = "bold green" if val > 0 else ("bold red" if val < 0 else "dim")
+    return Text(f"{sign}${val:.2f}", style=style)
 
 
-def bar(pct, width=20, fill_char="█", empty_char="░"):
-    """Create a progress bar."""
-    filled = int(pct * width)
-    return f"{C.BGREEN}{fill_char * filled}{C.DIM}{empty_char * (width - filled)}{C.RESET}"
-
-
-def spark(values, width=12):
-    """Create a sparkline from values."""
-    if not values:
-        return C.DIM + "─" * width + C.RESET
-    blocks = " ▁▂▃▄▅▆▇█"
-    mn, mx = min(values), max(values)
-    rng = mx - mn if mx != mn else 1
-    return "".join(blocks[min(8, int((v - mn) / rng * 8))] for v in values[-width:])
-
-
-def truncate(s, length=40):
-    """Truncate string with ellipsis."""
+def _cut(s: str, n: int = 36) -> str:
     s = str(s or "")
-    return s[:length - 1] + "…" if len(s) > length else s
+    return s[: n - 1] + "…" if len(s) > n else s
 
 
-class Dashboard:
-    """Terminal trading dashboard."""
+def _age(ts: str, now: datetime) -> str:
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        h = (now - dt).total_seconds() / 3600
+        return f"{h:.0f}h" if h < 48 else f"{h / 24:.0f}d"
+    except Exception:
+        return "?"
 
-    def __init__(self):
-        init_db()
-        self.conn = get_conn()
-        self.now = datetime.now(timezone.utc)
-        self.width = min(os.get_terminal_size().columns, 100) if sys.stdout.isatty() else 100
 
-    def close(self):
-        self.conn.close()
+# ─── Panel builders (pure Rich, no Textual) ──────────────────────────────────
 
-    def _line(self, char="─"):
-        print(f"{C.DIM}{char * self.width}{C.RESET}")
+def _build_portfolio() -> Panel:
+    from config import BANKROLL, CASH_RESERVE_PCT
 
-    def _header(self, text):
-        pad = self.width - len(text) - 4
-        print(f"\n{C.BOLD}{C.BCYAN}┌─ {text} {'─' * max(pad, 0)}┐{C.RESET}")
-
-    def _footer(self):
-        print(f"{C.DIM}{'─' * self.width}{C.RESET}")
-
-    def render(self):
-        """Render the full dashboard."""
-        self._render_banner()
-        self._render_portfolio()
-        self._render_open_trades()
-        self._render_paper_trades()
-        self._render_market_overview()
-        self._render_signal_health()
-        self._render_recent_activity()
-        self._render_footer()
-
-    # ─── Banner ──────────────────────────────────────────────────
-    def _render_banner(self):
-        os.system("clear" if os.name != "nt" else "cls")
-        print()
-        print(f"{C.BOLD}{C.BCYAN}  ╔══════════════════════════════════════════════════════════════╗{C.RESET}")
-        print(f"{C.BOLD}{C.BCYAN}  ║{C.RESET}  {C.BOLD}{C.BWHITE}P O L Y M A R K E T   T R A D I N G   T E R M I N A L{C.RESET}   {C.BOLD}{C.BCYAN}║{C.RESET}")
-        print(f"{C.BOLD}{C.BCYAN}  ╚══════════════════════════════════════════════════════════════╝{C.RESET}")
-        ts = self.now.strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"  {C.DIM}Last updated: {ts}{C.RESET}")
-
-    # ─── Portfolio Summary ───────────────────────────────────────
-    def _render_portfolio(self):
-        self._header("PORTFOLIO")
-
-        from config import BANKROLL, CASH_RESERVE_PCT
-
-        # Get trade stats
-        trades = self.conn.execute(
+    conn = _db()
+    try:
+        live   = conn.execute(
             "SELECT * FROM trades WHERE status='open' AND (is_paper IS NULL OR is_paper=0)"
         ).fetchall()
-        closed = self.conn.execute(
+        closed = conn.execute(
             "SELECT * FROM trades WHERE status!='open' AND (is_paper IS NULL OR is_paper=0)"
         ).fetchall()
+    finally:
+        conn.close()
 
-        deployed = sum(float(t["cost_basis"] or 0) for t in trades)
-        realized = sum(float(t["realized_pnl"] or 0) for t in closed)
-        unrealized = sum(float(t["unrealized_pnl"] or 0) for t in trades)
-        total_pnl = realized + unrealized
-        cash = BANKROLL + realized - deployed
-        cash_pct = cash / BANKROLL if BANKROLL > 0 else 0
+    deployed   = sum(float(t["cost_basis"] or 0) for t in live)
+    realized   = sum(float(t["realized_pnl"] or 0) for t in closed)
+    unrealized = sum(float(t["unrealized_pnl"] or 0) for t in live)
+    total_pnl  = realized + unrealized
+    cash       = BANKROLL + realized - deployed
+    cash_pct   = cash / BANKROLL if BANKROLL else 0
+    now_bk     = BANKROLL + total_pnl
 
-        # Bankroll bar
-        bankroll_now = BANKROLL + total_pnl
-        print(f"  {C.BOLD}Bankroll{C.RESET}     ${bankroll_now:>8.2f}  {bar(min(bankroll_now / BANKROLL, 1.0))}")
-        print(f"  {C.BOLD}Cash{C.RESET}         ${cash:>8.2f}  {C.DIM}({cash_pct:.0%} reserve){C.RESET}"
-              f"  {'  ' + C.BGREEN + 'OK' + C.RESET if cash_pct >= CASH_RESERVE_PCT else '  ' + C.BRED + 'LOW' + C.RESET}")
-        print(f"  {C.BOLD}Deployed{C.RESET}     ${deployed:>8.2f}  {C.DIM}across {len(trades)} position(s){C.RESET}")
-        print()
-        print(f"  {C.BOLD}Realized P&L{C.RESET}   {pnl_str(realized)}")
-        print(f"  {C.BOLD}Unrealized{C.RESET}     {pnl_str(unrealized)}")
-        print(f"  {C.BOLD}Total P&L{C.RESET}      {pnl_str(total_pnl)}")
+    filled  = int(min(now_bk / BANKROLL, 1.0) * 18)
+    bar     = Text("█" * filled + "░" * (18 - filled), style="green")
+    dd      = max(0.0, (BANKROLL - now_bk) / BANKROLL * 100)
+    dd_col  = "green" if dd < 5 else ("yellow" if dd < 20 else "bold red")
+    mode, mc = ("HALTED", "bold red") if dd >= 35 else \
+               ("DEFENSIVE", "bold yellow") if dd >= 20 else \
+               ("NORMAL", "bold green")
 
-        # Drawdown
-        peak = BANKROLL  # simplified — track real peak over time
-        dd = (peak - bankroll_now) / peak * 100 if peak > 0 else 0
-        dd_color = C.BGREEN if dd < 5 else (C.BYELLOW if dd < 20 else C.BRED)
-        mode = "NORMAL"
-        mode_color = C.BGREEN
-        if dd >= 35:
-            mode = "HALTED"
-            mode_color = C.BRED
-        elif dd >= 20:
-            mode = "DEFENSIVE"
-            mode_color = C.BYELLOW
+    g = Table.grid(padding=(0, 1))
+    g.add_column(style="bold",    width=14)
+    g.add_column(justify="right", width=10)
+    g.add_column()
 
-        print(f"\n  {C.BOLD}Drawdown{C.RESET}     {dd_color}{dd:.1f}%{C.RESET}  "
-              f"{C.BOLD}Mode:{C.RESET} {mode_color}{C.BOLD}{mode}{C.RESET}")
-        self._footer()
+    g.add_row("Bankroll",  f"${now_bk:>8.2f}", bar)
+    g.add_row("Cash",      f"${cash:>8.2f}",
+              Text(f"({cash_pct:.0%}) ", style="dim") +
+              Text("OK" if cash_pct >= CASH_RESERVE_PCT else "LOW",
+                   style="green" if cash_pct >= CASH_RESERVE_PCT else "bold red"))
+    g.add_row("Deployed",  f"${deployed:>8.2f}",
+              Text(f"{len(live)} position(s)", style="dim"))
+    g.add_row("", "", "")
+    g.add_row("Realized",  "", _pnl(realized))
+    g.add_row("Unrealized","", _pnl(unrealized))
+    g.add_row("Total P&L", "", _pnl(total_pnl))
+    g.add_row("", "", "")
+    g.add_row("Drawdown",
+              Text(f"{dd:.1f}%", style=dd_col),
+              Text(mode, style=mc))
 
-    # ─── Open Trades (Live) ──────────────────────────────────────
-    def _render_open_trades(self):
-        trades = self.conn.execute(
-            "SELECT * FROM trades WHERE status='open' AND (is_paper IS NULL OR is_paper=0) ORDER BY opened_at DESC"
-        ).fetchall()
+    return Panel(g, title="[bold cyan]PORTFOLIO[/]", border_style="cyan", box=box.ROUNDED)
 
-        self._header(f"LIVE TRADES ({len(trades)})")
 
-        if not trades:
-            print(f"  {C.DIM}No live trades open.{C.RESET}")
-            self._footer()
-            return
-
-        # Header row
-        print(f"  {C.BOLD}{C.CYAN}{'Market':<35} {'Side':<8} {'Entry':>7} {'Now':>7} {'P&L':>10} {'Age'}{C.RESET}")
-        print(f"  {C.DIM}{'─'*80}{C.RESET}")
-
-        for t in trades:
-            q = truncate(t["question"] or t["condition_id"], 34)
-            side = t["side"] or "?"
-            entry = float(t["entry_price"] or 0)
-            current = float(t["current_price"] or entry)
-            pnl = float(t["unrealized_pnl"] or 0)
-            opened = t["opened_at"] or ""
-
-            # Calculate age
-            try:
-                opened_dt = datetime.fromisoformat(opened.replace("Z", "+00:00"))
-                age_hrs = (self.now - opened_dt).total_seconds() / 3600
-                age_str = f"{age_hrs:.0f}h" if age_hrs < 48 else f"{age_hrs/24:.0f}d"
-            except Exception:
-                age_str = "?"
-
-            side_color = C.BGREEN if "YES" in side.upper() else C.BRED
-            print(f"  {q:<35} {side_color}{side:<8}{C.RESET} "
-                  f"${entry:>5.3f} ${current:>5.3f} {pnl_str(pnl):>18} {C.DIM}{age_str}{C.RESET}")
-
-        self._footer()
-
-    # ─── Paper Trades ────────────────────────────────────────────
-    def _render_paper_trades(self):
-        trades = self.conn.execute(
+def _build_paper_trades() -> Panel:
+    conn = _db()
+    try:
+        open_t = conn.execute(
             "SELECT * FROM trades WHERE is_paper=1 AND status='open' ORDER BY opened_at DESC"
         ).fetchall()
-        closed_paper = self.conn.execute(
+        closed = conn.execute(
             "SELECT * FROM trades WHERE is_paper=1 AND status!='open'"
         ).fetchall()
+    finally:
+        conn.close()
 
-        total_open = len(trades)
-        total_closed = len(closed_paper)
-        paper_deployed = sum(float(t["cost_basis"] or 0) for t in trades)
-        paper_realized = sum(float(t["realized_pnl"] or 0) for t in closed_paper)
-        paper_unrealized = sum(float(t["unrealized_pnl"] or 0) for t in trades)
+    deployed   = sum(float(t["cost_basis"] or 0) for t in open_t)
+    realized   = sum(float(t["realized_pnl"] or 0) for t in closed)
+    unrealized = sum(float(t["unrealized_pnl"] or 0) for t in open_t)
 
-        self._header(f"PAPER TRADES ({total_open} open, {total_closed} closed)")
+    summary = Text()
+    summary.append(f"{len(open_t)} open  {len(closed)} closed  ", style="dim")
+    summary.append(f"deployed ${deployed:.2f}  ")
+    summary.append("P&L ")
+    summary.append_text(_pnl(realized + unrealized))
 
-        if not trades and not closed_paper:
-            print(f"  {C.DIM}No paper trades yet. Run: python run.py paper-trade --top 20{C.RESET}")
-            self._footer()
-            return
+    tbl = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", expand=True, show_edge=False)
+    tbl.add_column("Market",  ratio=5, no_wrap=True)
+    tbl.add_column("Side",    width=8)
+    tbl.add_column("Entry",   justify="right", width=7)
+    tbl.add_column("Now",     justify="right", width=7)
+    tbl.add_column("P&L",     justify="right", width=9)
 
-        print(f"  {C.BOLD}Paper Deployed{C.RESET}  ${paper_deployed:>8.2f}")
-        print(f"  {C.BOLD}Paper P&L{C.RESET}       {pnl_str(paper_realized + paper_unrealized)}")
-        print()
-
-        # Header row
-        print(f"  {C.BOLD}{C.MAGENTA}{'Market':<35} {'Side':<8} {'Entry':>7} {'Now':>7} {'P&L':>10}{C.RESET}")
-        print(f"  {C.DIM}{'─'*72}{C.RESET}")
-
-        for t in trades[:10]:  # Show top 10
-            q = truncate(t["question"] or t["condition_id"], 34)
-            side = t["side"] or "?"
+    if not open_t:
+        tbl.add_row("[dim]No paper trades — run: python run.py paper-trade[/]",
+                    "", "", "", "")
+    else:
+        for t in open_t:
+            side  = t["side"] or "?"
             entry = float(t["entry_price"] or 0)
-            current = float(t["current_price"] or entry)
-            pnl = float(t["unrealized_pnl"] or 0)
+            cur   = float(t["current_price"] or entry)
+            pnl   = float(t["unrealized_pnl"] or 0)
+            tbl.add_row(
+                _cut(t["question"] or t["condition_id"]),
+                Text(side, style="green" if "YES" in side.upper() else "red"),
+                f"${entry:.3f}", f"${cur:.3f}", _pnl(pnl),
+            )
 
-            side_color = C.BGREEN if "YES" in side.upper() else C.BRED
-            print(f"  {q:<35} {side_color}{side:<8}{C.RESET} "
-                  f"${entry:>5.3f} ${current:>5.3f} {pnl_str(pnl):>18}")
+    return Panel(
+        Group(summary, tbl),
+        title=f"[bold cyan]PAPER TRADES[/] [dim]({len(open_t)} open, {len(closed)} closed)[/]",
+        border_style="cyan",
+        box=box.ROUNDED,
+    )
 
-        if total_open > 10:
-            print(f"  {C.DIM}... and {total_open - 10} more{C.RESET}")
 
-        self._footer()
+def _build_signals() -> Panel:
+    from config import NEWSAPI_KEY, MIROFISH_API_URL
 
-    # ─── Market Overview ─────────────────────────────────────────
-    def _render_market_overview(self):
-        stats = db_stats(self.conn)
+    miro = False
+    try:
+        import urllib.request
+        r = urllib.request.urlopen(f"{MIROFISH_API_URL}/health", timeout=1)
+        miro = r.status == 200
+    except Exception:
+        pass
 
-        self._header("MARKET OVERVIEW")
+    rows = [
+        ("Sharp Traders",  "7 whale wallets",          True),
+        ("Base Rate",      "Historical calibration",    True),
+        ("Cross-Platform", "Metaculus / Manifold",      True),
+        ("News Sentiment", "NewsAPI",                   bool(NEWSAPI_KEY)),
+        ("MiroFish Swarm", f"Docker @ {MIROFISH_API_URL}", miro),
+    ]
 
-        active = stats.get("active_markets", 0)
-        resolved = stats.get("resolved_markets", 0)
-        total = stats.get("markets", 0)
+    g = Table.grid(padding=(0, 1))
+    g.add_column(width=10)
+    g.add_column(style="bold", width=18)
+    g.add_column(style="dim")
 
-        print(f"  {C.BOLD}Active Markets{C.RESET}   {C.BWHITE}{active:>5}{C.RESET}")
-        print(f"  {C.BOLD}Resolved{C.RESET}         {C.DIM}{resolved:>5}{C.RESET}")
-        print(f"  {C.BOLD}Total Tracked{C.RESET}    {C.DIM}{total:>5}{C.RESET}")
-        print()
+    for name, desc, up in rows:
+        dot = Text("● ONLINE ", style="green") if up else Text("○ OFFLINE", style="red")
+        g.add_row(dot, name, desc)
 
-        # Category breakdown
-        by_type = stats.get("by_type", {})
-        if by_type:
-            print(f"  {C.BOLD}By Category:{C.RESET}")
-            icons = {
-                "political": "🗳 ", "crypto": "₿ ", "sports": "🏆",
-                "geopolitical": "🌍", "regulatory": "📋", "other": "📊",
-                None: "  ",
-            }
-            max_count = max(by_type.values()) if by_type else 1
-            for cat, count in sorted(by_type.items(), key=lambda x: -x[1]):
-                icon = icons.get(cat, "  ")
-                cat_name = (cat or "uncategorized").capitalize()
-                bar_w = int(count / max_count * 25) if max_count > 0 else 0
-                print(f"    {icon} {cat_name:<15} {C.BCYAN}{'█' * bar_w}{C.RESET} {count}")
-
-        self._footer()
-
-    # ─── Signal Health ───────────────────────────────────────────
-    def _render_signal_health(self):
-        self._header("SIGNAL STATUS")
-
-        from config import NEWSAPI_KEY, MIROFISH_API_URL
-
-        signals = [
-            ("Sharp Traders", "7 whale wallets", True, C.BGREEN),
-            ("Base Rate", "Historical calibration", True, C.BGREEN),
-            ("Cross-Platform", "Metaculus/Manifold", True, C.BGREEN),
-            ("News Sentiment", "NewsAPI", bool(NEWSAPI_KEY), C.BGREEN if NEWSAPI_KEY else C.BYELLOW),
-            ("MiroFish Swarm", f"Docker @ {MIROFISH_API_URL}", False, C.BRED),
-        ]
-
-        # Check MiroFish
-        try:
-            import urllib.request
-            req = urllib.request.urlopen(f"{MIROFISH_API_URL}/health", timeout=2)
-            if req.status == 200:
-                signals[4] = ("MiroFish Swarm", f"Docker @ {MIROFISH_API_URL}", True, C.BGREEN)
-        except Exception:
-            pass
-
-        for name, desc, active, color in signals:
-            status = f"{C.BGREEN}● ONLINE{C.RESET}" if active else f"{C.BRED}○ OFFLINE{C.RESET}"
-            print(f"  {status}  {C.BOLD}{name:<20}{C.RESET} {C.DIM}{desc}{C.RESET}")
-
-        # Calibration stats
-        row = self.conn.execute(
-            "SELECT COUNT(*) as n FROM resolutions WHERE brier_score_ours IS NOT NULL"
+    conn = _db()
+    try:
+        n    = conn.execute(
+            "SELECT COUNT(*) AS n FROM resolutions WHERE brier_score_ours IS NOT NULL"
+        ).fetchone()["n"]
+        br   = conn.execute(
+            "SELECT AVG(brier_score_ours) as o, AVG(brier_score_market) as m "
+            "FROM resolutions WHERE brier_score_ours IS NOT NULL"
         ).fetchone()
-        cal_n = row["n"] if row else 0
+    finally:
+        conn.close()
 
-        brier_row = self.conn.execute("""
-            SELECT AVG(brier_score_ours) as ours, AVG(brier_score_market) as mkt
-            FROM resolutions WHERE brier_score_ours IS NOT NULL
-        """).fetchone()
+    cal = Text(f"\n  {n} resolved predictions", style="dim")
+    if br and br["o"]:
+        imp = ((br["m"] - br["o"]) / br["m"] * 100) if br["m"] else 0
+        cal.append(f"  Brier {br['o']:.4f} vs mkt {br['m']:.4f}  ", style="dim")
+        cal.append(f"{imp:+.1f}%", style="green" if imp > 0 else "red")
 
-        print()
-        print(f"  {C.BOLD}Calibration:{C.RESET}  {cal_n} resolved predictions")
-        if brier_row and brier_row["ours"]:
-            ours = brier_row["ours"]
-            mkt = brier_row["mkt"]
-            improvement = ((mkt - ours) / mkt * 100) if mkt and mkt > 0 else 0
-            imp_color = C.BGREEN if improvement > 0 else C.BRED
-            print(f"  {C.BOLD}Our Brier{C.RESET}     {C.BCYAN}{ours:.4f}{C.RESET}  "
-                  f"{C.DIM}vs market {mkt:.4f}{C.RESET}  "
-                  f"{imp_color}{improvement:+.1f}%{C.RESET}")
+    return Panel(Group(g, cal), title="[bold cyan]SIGNALS[/]",
+                 border_style="cyan", box=box.ROUNDED)
 
-        self._footer()
 
-    # ─── Recent Activity ─────────────────────────────────────────
-    def _render_recent_activity(self):
-        self._header("RECENT ACTIVITY")
+def _build_activity() -> Panel:
+    now  = datetime.now(timezone.utc)
+    conn = _db()
+    try:
+        preds = conn.execute(
+            "SELECT question, our_estimate, market_price_at, delta, confidence, predicted_at "
+            "FROM predictions ORDER BY predicted_at DESC LIMIT 8"
+        ).fetchall()
+    finally:
+        conn.close()
 
-        # Recent predictions
-        preds = self.conn.execute("""
-            SELECT question, our_estimate, market_price_at, delta, confidence, predicted_at
-            FROM predictions ORDER BY predicted_at DESC LIMIT 5
-        """).fetchall()
+    tbl = Table(box=box.SIMPLE_HEAD, header_style="bold cyan", expand=True, show_edge=False)
+    tbl.add_column("",    width=2)
+    tbl.add_column("Market", ratio=4, no_wrap=True)
+    tbl.add_column("Est", justify="right", width=5)
+    tbl.add_column("Mkt", justify="right", width=5)
+    tbl.add_column("Δ",   justify="right", width=6)
+    tbl.add_column("Conf",width=4)
+    tbl.add_column("Age", justify="right", width=5, style="dim")
 
-        if preds:
-            for p in preds:
-                q = truncate(p["question"] or "?", 35)
-                est = float(p["our_estimate"] or 0)
-                mkt = float(p["market_price_at"] or 0)
-                delta = float(p["delta"] or 0)
-                conf = (p["confidence"] or "?").upper()
-                delta_color = C.BGREEN if abs(delta) >= 0.05 else C.DIM
+    if not preds:
+        tbl.add_row("", "[dim]No predictions — run: python run.py scan --top 20[/]",
+                    "", "", "", "", "")
+    else:
+        for p in preds:
+            d  = float(p["delta"] or 0)
+            c  = (p["confidence"] or "?").upper()
+            arrow = "▲" if d > 0.02 else ("▼" if d < -0.02 else "─")
+            dc    = "green" if d > 0.02 else ("red" if d < -0.02 else "dim")
+            cc    = {"HIGH": "green", "MEDIUM": "yellow", "LOW": "red"}.get(c, "dim")
+            tbl.add_row(
+                Text(arrow, style=dc),
+                _cut(p["question"] or "?", 32),
+                f"{float(p['our_estimate'] or 0):.2f}",
+                f"{float(p['market_price_at'] or 0):.2f}",
+                Text(f"{d:+.2f}", style=dc),
+                Text(c[:3], style=cc),
+                _age(p["predicted_at"] or "", now),
+            )
 
-                conf_color = {
-                    "HIGH": C.BGREEN, "MEDIUM": C.BYELLOW, "LOW": C.BRED
-                }.get(conf, C.DIM)
+    return Panel(tbl, title="[bold cyan]RECENT ACTIVITY[/]",
+                 border_style="cyan", box=box.ROUNDED)
 
-                ts = ""
-                try:
-                    dt = datetime.fromisoformat((p["predicted_at"] or "").replace("Z", "+00:00"))
-                    age = (self.now - dt).total_seconds() / 3600
-                    ts = f"{age:.0f}h ago" if age < 48 else f"{age/24:.0f}d ago"
-                except Exception:
-                    pass
 
-                print(f"  {delta_color}{'▲' if delta > 0 else '▼' if delta < 0 else '─'}{C.RESET} "
-                      f"{q} "
-                      f"{C.DIM}est={est:.2f} mkt={mkt:.2f}{C.RESET} "
-                      f"{delta_color}{delta:+.2f}{C.RESET} "
-                      f"{conf_color}[{conf}]{C.RESET} "
-                      f"{C.DIM}{ts}{C.RESET}")
-        else:
-            print(f"  {C.DIM}No predictions yet. Run: python run.py scan --top 20{C.RESET}")
+def _build_market_overview() -> Panel:
+    from db import db_stats
+    conn = _db()
+    try:
+        stats = db_stats(conn)
+    finally:
+        conn.close()
 
-        self._footer()
+    by_type = stats.get("by_type", {})
+    icons   = {"political": "🗳", "crypto": "₿", "sports": "🏆",
+               "geopolitical": "🌍", "regulatory": "📋", "other": "📊"}
 
-    # ─── Footer ──────────────────────────────────────────────────
-    def _render_footer(self):
-        print()
-        print(f"  {C.DIM}Commands:{C.RESET}")
-        print(f"    {C.CYAN}python run.py scan --top 20{C.RESET}    {C.DIM}Scan for opportunities{C.RESET}")
-        print(f"    {C.CYAN}python run.py paper-trade{C.RESET}      {C.DIM}Run paper trading session{C.RESET}")
-        print(f"    {C.CYAN}python run.py paper-report{C.RESET}     {C.DIM}Check paper trade results{C.RESET}")
-        print(f"    {C.CYAN}python run.py fetch{C.RESET}            {C.DIM}Fetch fresh market data{C.RESET}")
-        print(f"    {C.CYAN}python run.py dashboard{C.RESET}        {C.DIM}Refresh this view{C.RESET}")
-        print()
-        print(f"  {C.BOLD}{C.BCYAN}  ─── POLYMARKET AGENT v1.0 ── Phase 4 Complete ───{C.RESET}")
-        print()
+    g = Table.grid(padding=(0, 1))
+    g.add_column(width=4)
+    g.add_column(width=16)
+    g.add_column(width=26)
+    g.add_column(justify="right", width=5)
 
+    g.add_row("", Text("Active",   style="bold"),
+              "", Text(str(stats.get("active_markets", 0)),   style="bold white"))
+    g.add_row("", Text("Resolved", style="dim"),
+              "", Text(str(stats.get("resolved_markets", 0)), style="dim"))
+    g.add_row("", Text("Total",    style="dim"),
+              "", Text(str(stats.get("markets", 0)),          style="dim"))
+
+    if by_type:
+        g.add_row("", "", "", "")
+        mx = max(by_type.values()) if by_type else 1
+        for cat, cnt in sorted(by_type.items(), key=lambda x: -x[1]):
+            bw = int(cnt / mx * 22) if mx else 0
+            g.add_row(icons.get(cat, "  "),
+                      (cat or "other").capitalize(),
+                      Text("█" * bw, style="cyan"),
+                      str(cnt))
+
+    return Panel(g, title="[bold cyan]MARKETS[/]", border_style="cyan", box=box.ROUNDED)
+
+
+# ─── Textual widgets (call builders, refresh on interval) ────────────────────
+
+class PortfolioPanel(Static):
+    DEFAULT_CSS = "PortfolioPanel { height: 1fr; border: blank; }"
+
+    def render(self):
+        try:
+            return _build_portfolio()
+        except Exception as e:
+            return Panel(f"[red]Error: {e}[/]", title="PORTFOLIO", box=box.ROUNDED)
+
+    def on_mount(self):
+        self.set_interval(10, self.refresh)
+
+
+class PaperTradesPanel(Static):
+    DEFAULT_CSS = "PaperTradesPanel { height: 1fr; border: blank; }"
+
+    def render(self):
+        try:
+            return _build_paper_trades()
+        except Exception as e:
+            return Panel(f"[red]Error: {e}[/]", title="PAPER TRADES", box=box.ROUNDED)
+
+    def on_mount(self):
+        self.set_interval(10, self.refresh)
+
+
+class SignalsPanel(Static):
+    DEFAULT_CSS = "SignalsPanel { height: 1fr; border: blank; }"
+
+    def render(self):
+        try:
+            return _build_signals()
+        except Exception as e:
+            return Panel(f"[red]Error: {e}[/]", title="SIGNALS", box=box.ROUNDED)
+
+    def on_mount(self):
+        self.set_interval(30, self.refresh)
+
+
+class ActivityPanel(Static):
+    DEFAULT_CSS = "ActivityPanel { height: 1fr; border: blank; }"
+
+    def render(self):
+        try:
+            return _build_activity()
+        except Exception as e:
+            return Panel(f"[red]Error: {e}[/]", title="ACTIVITY", box=box.ROUNDED)
+
+    def on_mount(self):
+        self.set_interval(10, self.refresh)
+
+
+class MarketPanel(Static):
+    DEFAULT_CSS = "MarketPanel { height: 14; border: blank; }"
+
+    def render(self):
+        try:
+            return _build_market_overview()
+        except Exception as e:
+            return Panel(f"[red]Error: {e}[/]", title="MARKETS", box=box.ROUNDED)
+
+    def on_mount(self):
+        self.set_interval(60, self.refresh)
+
+
+# ─── App ─────────────────────────────────────────────────────────────────────
+
+class TradingApp(App):
+    TITLE       = "Polymarket Trading Terminal"
+    SUB_TITLE   = "v1.0 — Phase 5"
+
+    CSS = """
+    Screen {
+        background: #0d1117;
+    }
+    #top {
+        height: 1fr;
+    }
+    #left {
+        width: 46;
+        height: 100%;
+    }
+    #right {
+        width: 1fr;
+        height: 100%;
+    }
+    #bottom {
+        height: 14;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit",    "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("s", "scan",    "Scan"),
+        Binding("f", "fetch",   "Fetch"),
+        Binding("p", "paper",   "Paper-trade"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="top"):
+            with Vertical(id="left"):
+                yield PortfolioPanel()
+                yield SignalsPanel()
+            with Vertical(id="right"):
+                yield PaperTradesPanel()
+                yield ActivityPanel()
+        with Horizontal(id="bottom"):
+            yield MarketPanel()
+
+    def action_refresh(self) -> None:
+        for cls in (PortfolioPanel, PaperTradesPanel, SignalsPanel,
+                    ActivityPanel, MarketPanel):
+            for w in self.query(cls):
+                w.refresh()
+        self.notify("Refreshed", timeout=1.5)
+
+    def action_scan(self) -> None:
+        self.notify("Scanning markets…", timeout=3)
+        self._bg(["python3", "run.py", "scan", "--top", "20"])
+
+    def action_fetch(self) -> None:
+        self.notify("Fetching market data…", timeout=3)
+        self._bg(["python3", "run.py", "fetch"])
+
+    def action_paper(self) -> None:
+        self.notify("Running paper-trade session…", timeout=3)
+        self._bg(["python3", "run.py", "paper-trade"])
+
+    @work(thread=True)
+    def _bg(self, cmd: list[str]) -> None:
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(cmd, cwd=cwd, capture_output=True)
+        self.call_from_thread(self.action_refresh)
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
-    dash = Dashboard()
-    try:
-        dash.render()
-    finally:
-        dash.close()
+    TradingApp().run()
 
 
 if __name__ == "__main__":

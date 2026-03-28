@@ -701,12 +701,8 @@ def cmd_paper_report(args):
 
 def cmd_dashboard(args):
     """Launch the trading terminal dashboard."""
-    from dashboard import Dashboard
-    dash = Dashboard()
-    try:
-        dash.render()
-    finally:
-        dash.close()
+    from dashboard import main as dashboard_main
+    dashboard_main()
 
 
 def cmd_fetch(args):
