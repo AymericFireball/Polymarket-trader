@@ -39,7 +39,7 @@ class DecisionGate:
     This is the last line of defense against bad trades.
     """
 
-    def __init__(self, min_edge_cents: int = 8,
+    def __init__(self, min_edge_cents: int = 5,
                  require_sharp_agreement: bool = True,
                  min_confidence: str = "medium"):
         self.min_edge_cents = min_edge_cents
@@ -94,19 +94,17 @@ class DecisionGate:
         sharp_consensus = "NONE"
 
         if sharp_signal:
-            # Get the raw sharp trader data
             sharp_score = sharp_signal.get("score", 0)
-            sharp_consensus = sharp_signal.get("summary", "")
-            if "YES" in sharp_consensus.upper():
-                sharp_consensus = "YES"
-            elif "NO" in sharp_consensus.upper():
-                sharp_consensus = "NO"
-            else:
+            if abs(sharp_score) < 0.01:
                 sharp_consensus = "NONE"
+            elif sharp_score > 0:
+                sharp_consensus = "YES"
+            else:
+                sharp_consensus = "NO"
 
         if self.require_sharp_agreement:
             if sharp_consensus == "NONE":
-                # No sharp data — allow but note it
+                # No sharp data — waive requirement, proceed on edge alone
                 reasons.append("Sharp traders: no data (waived)")
             elif (side == "YES" and sharp_consensus == "YES") or \
                  (side == "NO" and sharp_consensus == "NO"):

@@ -28,7 +28,7 @@ CASH_RESERVE_PCT = 0.30        # Minimum 30% cash reserve
 MAX_SINGLE_POSITION_PCT = 0.10 # Max 10% of bankroll per position
 MAX_CORRELATED_PCT = 0.25      # Max 25% on correlated narrative
 MIN_EDGE_CENTS = 5             # Minimum edge to trade (cents)
-DEFENSIVE_MIN_EDGE_CENTS = 8   # Edge required in defensive mode
+DEFENSIVE_MIN_EDGE_CENTS = 5   # Edge required in defensive mode
 KELLY_FRACTION = 0.5           # Half-Kelly default
 STOP_LOSS_CENTS = 15           # Exit if 15c against you
 TAKE_PROFIT_THRESHOLD = 0.93   # Consider trimming above this
@@ -75,6 +75,6 @@ SHRINKAGE_MIN_PREDICTIONS = 50  # Stop shrinking after this many resolved
 PLATT_MIN_PREDICTIONS = 30      # Start Platt scaling after this many
 
 # ─── DECISION GATE ───────────────────────────────────────────────
-GATE_MIN_EDGE_CENTS = 8         # Minimum edge for pipeline to approve
+GATE_MIN_EDGE_CENTS = 5         # Minimum edge for pipeline to approve
 GATE_REQUIRE_SHARP = True       # Require sharp trader agreement
 GATE_MIN_CONFIDENCE = "medium"  # Minimum confidence level

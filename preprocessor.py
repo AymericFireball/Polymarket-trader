@@ -165,10 +165,15 @@ def _detect_contradictions(processed_signals: Dict) -> List[str]:
     signal_scores = {k: v["score"] for k, v in processed_signals.items()}
 
     # Check for strong disagreements
+    seen_pairs = set()
     for s1, score1 in signal_scores.items():
         for s2, score2 in signal_scores.items():
-            if s1 >= s2:
+            if s1 == s2:
                 continue
+            pair_key = tuple(sorted([s1, s2]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
             # If one is strongly positive and other strongly negative
             if (score1 > 0.3 and score2 < -0.3) or (score1 < -0.3 and score2 > 0.3):
                 contradictions.append(

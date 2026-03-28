@@ -123,19 +123,19 @@ def fit_platt_parameters(predictions: List[Tuple[float, float]]) -> Tuple[float,
     if ss_logit < eps:
         return (1.0, 0.0)
 
-    ss_cross = sum((l - mean_logit) * (a - mean_actual)
-                   for l, a in zip(logits, actuals))
+    ss_cross = sum((l - mean_logit) * (act - mean_actual)
+                   for l, act in zip(logits, actuals))
 
     # Slope in probability space (approximate)
-    a = max(0.5, min(2.0, 1.0 + ss_cross / ss_logit))  # Bounded adjustment
+    platt_a = max(0.5, min(2.0, 1.0 + ss_cross / ss_logit))  # Bounded adjustment
 
     # Intercept: correct for mean bias
     target_logit = math.log(max(eps, mean_actual) / max(eps, 1 - mean_actual))
-    current_logit = mean_logit * a
+    current_logit = mean_logit * platt_a
     b = target_logit - current_logit
     b = max(-1.0, min(1.0, b))  # Bounded
 
-    return (round(a, 4), round(b, 4))
+    return (round(platt_a, 4), round(b, 4))
 
 
 # ─── Calibration Analysis ────────────────────────────────────────

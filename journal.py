@@ -216,15 +216,15 @@ def daily_pnl_report() -> str:
         flags.append(f"Deployed {total_deployed/BANKROLL:.0%} > 70% threshold")
     # Check for correlated positions (same market_type)
     types = {}
+    conn = get_conn()
     for p in open_pos:
-        conn = get_conn()
         mkt = conn.execute(
             "SELECT market_type FROM markets WHERE condition_id=?",
             (p.get("condition_id", ""),)
         ).fetchone()
-        conn.close()
         mtype = dict(mkt)["market_type"] if mkt else "other"
         types[mtype] = types.get(mtype, 0) + (p.get("cost_basis", 0) or 0)
+    conn.close()
     for mtype, exposure in types.items():
         if exposure / BANKROLL > 0.25:
             flags.append(f"Concentration: {mtype} exposure ${exposure:.0f} ({exposure/BANKROLL:.0%})")

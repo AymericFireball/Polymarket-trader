@@ -376,7 +376,9 @@ def get_sharp_trader_signal(token_ids: List[str], outcomes: List[str] = None,
 
     for wallet_info in wallets:
         if isinstance(wallet_info, tuple):
-            addr, label, notes = wallet_info[0], wallet_info[1], wallet_info[2] if len(wallet_info) > 2 else ""
+            addr = wallet_info[0]
+            label = wallet_info[1]
+            notes = wallet_info[3] if len(wallet_info) > 3 else ""
         elif isinstance(wallet_info, dict):
             addr = wallet_info.get("address", "")
             label = wallet_info.get("label", "")

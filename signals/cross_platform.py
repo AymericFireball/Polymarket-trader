@@ -96,13 +96,23 @@ def search_manifold(question: str, limit: int = 5) -> List[Dict]:
         return []
 
 
+STOP_WORDS = {
+    "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
+    "by", "with", "from", "that", "this", "be", "been", "is", "was", "are",
+    "were", "it", "its", "as", "not", "no", "yes", "if", "than", "then",
+    "what", "when", "who", "which", "how", "their", "they", "he", "she",
+    "we", "you", "i", "my", "his", "her", "our", "any", "all", "more",
+    "least", "most", "before", "after", "during", "about", "between",
+}
+
+
 def compute_similarity(polymarket_question: str, other_title: str) -> float:
     """
     Simple word-overlap similarity between two questions.
     Returns 0-1 score.
     """
-    words1 = set(normalize_question(polymarket_question).split())
-    words2 = set(normalize_question(other_title).split())
+    words1 = set(normalize_question(polymarket_question).split()) - STOP_WORDS
+    words2 = set(normalize_question(other_title).split()) - STOP_WORDS
 
     if not words1 or not words2:
         return 0.0
@@ -137,7 +147,7 @@ def get_cross_platform_signal(question: str, polymarket_price: float) -> Dict:
     platforms_checked.append("metaculus")
     for r in metaculus_results:
         sim = compute_similarity(question, r["title"])
-        if sim >= 0.2:  # Minimum similarity threshold
+        if sim >= 0.35:  # Minimum similarity threshold
             r["similarity"] = round(sim, 3)
             r["price"] = r.get("community_prediction")
             all_matches.append(r)

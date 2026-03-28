@@ -6,6 +6,7 @@ Central CLI for daily operations. Ties all pipeline stages together.
 
 Usage:
   python run.py status                         System status overview
+  python run.py fetch [--pages N] [--limit N]  Fetch live market data from Gamma API
   python run.py scan [--top N]                 Scan top N markets & generate signals
   python run.py analyze <cid|keyword> [-p 0.7] Deep analysis on a specific market
   python run.py execute <cid> <side> <size>    Execute a trade (dry-run by default)
@@ -41,6 +42,7 @@ except ImportError:
 from pipeline import Pipeline, format_trade_signal, format_portfolio_report
 from calibration import calibrate_probability, compute_calibration_stats, get_calibration_data
 from risk_manager import RiskManager, PortfolioState
+from scraper import normalize_gamma_market
 
 
 def cmd_status(args):
@@ -284,19 +286,31 @@ def cmd_execute(args):
 
     executor = TradeExecutor(dry_run=not live)
     thesis = getattr(args, "thesis", "Manual execution via CLI")
-    result = executor.execute_trade(
-        market=market,
-        side=side,
-        size_usdc=size,
-        thesis=thesis,
-        invalidation="Manual trade — set your own invalidation criteria",
-    )
+    price = market.get("yes_price" if side == "YES" else "no_price") or 0.5
+    signal = {
+        "market": market["question"],
+        "condition_id": market["condition_id"],
+        "side": f"BUY {side}",
+        "entry_target": price,
+        "position_size": size,
+        "position_pct": size / BANKROLL if BANKROLL else 0,
+        "stop_loss": round(max(0.01, price - 0.10), 4),
+        "take_profit": round(min(0.99, price + 0.15), 4),
+        "order_type": "GTC",
+        "edge_cents": 0,
+        "thesis": thesis,
+        "invalidation": "Manual trade — set your own invalidation criteria",
+    }
+    result = executor.execute_signal(signal)
 
-    if result.get("success"):
-        print(f"\n  ✓ Trade executed: trade_id={result['trade_id']}")
-        print(f"    Entry: ${result['entry_price']:.4f} | Qty: {result['quantity']:.4f}")
+    if result.get("status") in ("executed", "partial"):
+        orders = result.get("orders", [])
+        print(f"\n  Trade status: {result['status']}")
+        for o in orders:
+            print(f"    order_id={o.get('order_id')} price=${o.get('price', 0):.4f} size=${o.get('size_usd', 0):.2f}")
     else:
-        print(f"\n  ✗ Execution failed: {result.get('error')}")
+        errors = result.get("errors", [])
+        print(f"\n  Execution failed: {'; '.join(errors) if errors else result.get('status')}")
 
 
 def cmd_monitor(args):
@@ -562,6 +576,60 @@ def cmd_import(args):
     print(f"Imported {imported} markets from {filepath}. DB total: {total}")
 
 
+def cmd_fetch(args):
+    """Fetch live market data from the Gamma API and upsert into the DB."""
+    init_db()
+    from api_client import PolymarketClient
+    from db import upsert_market
+
+    client = PolymarketClient()
+    limit = getattr(args, "limit", 100)
+    pages = getattr(args, "pages", 5)
+    resolved = getattr(args, "resolved", False)
+
+    conn = get_conn()
+    total_upserted = 0
+
+    for page in range(pages):
+        offset = page * limit
+        print(f"  Fetching page {page + 1}/{pages} (offset={offset}, limit={limit})...", end=" ", flush=True)
+        try:
+            raw_markets = client.get_gamma_markets(
+                limit=limit,
+                offset=offset,
+                active=not resolved,
+                closed=resolved,
+            )
+        except Exception as e:
+            print(f"ERROR: {e}")
+            break
+
+        if not raw_markets:
+            print("no results — stopping.")
+            break
+
+        page_count = 0
+        for m in raw_markets:
+            try:
+                normalized = normalize_gamma_market(m)
+                if normalized:
+                    upsert_market(conn, normalized)
+                    page_count += 1
+            except Exception:
+                continue
+
+        conn.commit()
+        total_upserted += page_count
+        print(f"{page_count} markets upserted.")
+
+        if len(raw_markets) < limit:
+            break  # Last page
+
+    active = conn.execute("SELECT COUNT(*) FROM markets WHERE resolved=0").fetchone()[0]
+    conn.close()
+    print(f"\nDone. Total upserted this run: {total_upserted}. Active markets in DB: {active}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Polymarket Trading Agent",
@@ -569,6 +637,8 @@ def main():
         epilog="""
 Examples:
   python run.py status                          System overview
+  python run.py fetch                           Fetch 5 pages of live market data
+  python run.py fetch --pages 1 --limit 50      Fetch 1 page of 50 markets
   python run.py scan --top 20                   Scan top 20 markets for signals
   python run.py analyze "Iran ceasefire"        Analyze market by keyword
   python run.py analyze <cid> -p 0.72           Analyze with your probability estimate
@@ -592,6 +662,12 @@ Examples:
 
     # status
     subs.add_parser("status", help="System status overview")
+
+    # fetch
+    fetch_p = subs.add_parser("fetch", help="Fetch live market data from Gamma API")
+    fetch_p.add_argument("--limit", type=int, default=100, help="Markets per page (default: 100)")
+    fetch_p.add_argument("--pages", type=int, default=5, help="Number of pages to fetch (default: 5)")
+    fetch_p.add_argument("--resolved", action="store_true", help="Fetch resolved markets instead of active")
 
     # scan
     scan_p = subs.add_parser("scan", help="Scan markets for trade signals")
@@ -649,6 +725,7 @@ Examples:
 
     commands = {
         "status": cmd_status,
+        "fetch": cmd_fetch,
         "scan": cmd_scan,
         "analyze": cmd_analyze,
         "execute": cmd_execute,
