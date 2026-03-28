@@ -7,8 +7,31 @@ Outputs a clean context_bundle for MiroFish simulation.
 """
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+
+# Half-lives must match signal_fusion.DECAY_HALF_LIVES
+_DECAY_HALF_LIVES: Dict[str, float] = {
+    "news":           12.0,
+    "sharp_trader":   48.0,
+    "cross_platform": 24.0,
+    "base_rate":     720.0,
+}
+
+
+def _apply_time_decay(weight: float, signal: Dict, half_life_hours: float) -> float:
+    ts_str = signal.get("freshness_ts")
+    if not ts_str:
+        return weight
+    try:
+        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+        return weight * (0.5 ** (age_hours / half_life_hours))
+    except (ValueError, TypeError):
+        return weight
 
 
 def preprocess_signals(signals: Dict[str, Dict]) -> Dict:
@@ -106,6 +129,11 @@ def _get_signal_weight(signal_type: str, signal: Dict) -> float:
         weight *= 0.5  # Few traders = less reliable
     if signal_type == "news" and signal.get("article_count", 0) < 3:
         weight *= 0.7  # Few articles = less coverage
+
+    # Time-decay: reduce weight for stale signals
+    half_life = _DECAY_HALF_LIVES.get(signal_type)
+    if half_life:
+        weight = _apply_time_decay(weight, signal, half_life)
 
     return round(weight, 3)
 

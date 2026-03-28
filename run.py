@@ -19,6 +19,10 @@ Usage:
   python run.py seed                           Bootstrap calibration with synthetic data
   python run.py import-resolved [--csv file]   Import resolved markets for calibration
   python run.py import <file>                  Import market data from JSON
+  python run.py backtest [--limit N]           Backtest fusion engine on resolved markets
+  python run.py tune-weights                   Update signal weights from accuracy history
+  python run.py paper-trade [--top N]          Paper-trade session (no real orders)
+  python run.py paper-report                   Report on paper-trade performance
 """
 
 import argparse
@@ -576,6 +580,91 @@ def cmd_import(args):
     print(f"Imported {imported} markets from {filepath}. DB total: {total}")
 
 
+def cmd_backtest(args):
+    """Run backtest comparing fusion engine vs simple average on resolved markets."""
+    from backtester import run_backtest, print_backtest_report
+    limit   = getattr(args, "limit",   200)
+    verbose = getattr(args, "verbose", False)
+    record  = getattr(args, "record",  False)
+
+    print(f"Running backtest on up to {limit} resolved markets...")
+    if record:
+        print("  (--record: writing Brier scores to signal_accuracy table)")
+    print()
+
+    stats = run_backtest(limit=limit, verbose=verbose, record=record)
+    print_backtest_report(stats)
+
+    if not stats:
+        print("  Tip: fetch resolved markets first:")
+        print("       python run.py fetch --resolved --pages 10")
+
+
+def cmd_tune_weights(args):
+    """Recompute signal weights from signal_accuracy history and print recommendations."""
+    init_db()
+    from signal_fusion import SignalFusionEngine
+
+    conn = get_conn()
+    engine = SignalFusionEngine()
+    lookback = getattr(args, "lookback", 90)
+    min_samples = getattr(args, "min_samples", 20)
+
+    result = engine.compute_optimal_weights(
+        conn, lookback_days=lookback, min_samples=min_samples
+    )
+    conn.close()
+
+    if result["status"] == "insufficient_data":
+        print("Insufficient signal_accuracy data to tune weights.")
+        print("  Run: python run.py backtest --record  (to populate history)")
+        return
+
+    print("=" * 60)
+    print("SIGNAL WEIGHT RECOMMENDATIONS")
+    print("=" * 60)
+    print(f"  Based on last {lookback} days, min {min_samples} samples per signal")
+    print()
+
+    from signal_fusion import WEIGHT_PROFILES
+    for mtype, weights in sorted(result["profiles"].items()):
+        counts = result["sample_counts"].get(mtype, {})
+        current = WEIGHT_PROFILES.get(mtype, WEIGHT_PROFILES["default"])
+        print(f"  Profile: {mtype}")
+        print(f"  {'Signal':<16} {'Current':>8} {'Suggested':>10} {'Samples':>8}")
+        print(f"  {'-'*44}")
+        for sig, new_w in sorted(weights.items()):
+            old_w = current.get(sig, 0.0)
+            n = counts.get(sig, 0)
+            delta = new_w - old_w
+            flag = " <-- update" if abs(delta) > 0.03 and n >= min_samples else ""
+            print(f"  {sig:<16} {old_w:>8.3f} {new_w:>10.3f} {n:>8d}{flag}")
+        print()
+
+    print("  To apply these weights permanently, edit WEIGHT_PROFILES in signal_fusion.py")
+
+
+def cmd_paper_trade(args):
+    """Run a paper-trading session (no real orders placed)."""
+    from paper_trader import run_paper_session, paper_report
+    top_n   = getattr(args, "top",     20)
+    verbose = getattr(args, "verbose", False)
+
+    print(f"Paper-trading session — scanning top {top_n} markets...")
+    print()
+    stats = run_paper_session(top_n=top_n, verbose=verbose)
+    print(f"\nScanned: {stats['scanned']}  |  Signals: {stats['signals']}  |  Recorded: {stats['recorded']}")
+    print()
+    print(paper_report(verbose=verbose))
+
+
+def cmd_paper_report(args):
+    """Print the paper-trading performance report."""
+    from paper_trader import paper_report
+    verbose = getattr(args, "verbose", False)
+    print(paper_report(verbose=verbose))
+
+
 def cmd_fetch(args):
     """Fetch live market data from the Gamma API and upsert into the DB."""
     init_db()
@@ -656,6 +745,11 @@ Examples:
   python run.py import-resolved                 Import resolved_markets_400.csv
   python run.py import-resolved --csv file.csv  Import from specific CSV
   python run.py import markets.json             Import active market data from JSON
+  python run.py fetch --resolved --pages 10     Fetch 10 pages of resolved markets
+  python run.py backtest --limit 200 --record   Backtest + record Brier scores
+  python run.py tune-weights                    Recommend new signal weights
+  python run.py paper-trade --top 30            Paper-trade session on top 30 markets
+  python run.py paper-report --verbose          Show all paper trades + P&L
         """
     )
     subs = parser.add_subparsers(dest="command")
@@ -721,6 +815,26 @@ Examples:
     import_p = subs.add_parser("import", help="Import active market data from JSON")
     import_p.add_argument("file", help="Path to JSON file")
 
+    # backtest
+    bt_p = subs.add_parser("backtest", help="Backtest fusion engine on resolved markets")
+    bt_p.add_argument("--limit",   type=int, default=200,   help="Max resolved markets to test (default: 200)")
+    bt_p.add_argument("--verbose", action="store_true",     help="Print per-market results")
+    bt_p.add_argument("--record",  action="store_true",     help="Write Brier scores to signal_accuracy table")
+
+    # tune-weights
+    tw_p = subs.add_parser("tune-weights", help="Recommend signal weight updates from accuracy history")
+    tw_p.add_argument("--lookback",     type=int, default=90, help="Days of history to use (default: 90)")
+    tw_p.add_argument("--min-samples",  type=int, default=20, help="Min samples required per signal (default: 20)")
+
+    # paper-trade
+    pt_p = subs.add_parser("paper-trade", help="Simulated trading session (no real orders)")
+    pt_p.add_argument("--top",     type=int, default=20, help="Markets to scan (default: 20)")
+    pt_p.add_argument("--verbose", action="store_true",  help="Print per-market details")
+
+    # paper-report
+    pr_p = subs.add_parser("paper-report", help="Paper-trading performance report")
+    pr_p.add_argument("--verbose", action="store_true", help="Show individual trade details")
+
     args = parser.parse_args()
 
     commands = {
@@ -738,6 +852,10 @@ Examples:
         "seed": cmd_seed,
         "import-resolved": cmd_import_resolved,
         "import": cmd_import,
+        "backtest": cmd_backtest,
+        "tune-weights": cmd_tune_weights,
+        "paper-trade": cmd_paper_trade,
+        "paper-report": cmd_paper_report,
     }
 
     if args.command in commands:

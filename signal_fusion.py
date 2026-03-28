@@ -264,7 +264,8 @@ class SignalFusionEngine:
             return 1.0
 
         ts_str = (
-            signal.get("timestamp")
+            signal.get("freshness_ts")   # primary key used by all signal generators
+            or signal.get("timestamp")
             or signal.get("fetched_at")
             or signal.get("ran_at")
             or signal.get("completed_at")
@@ -359,6 +360,109 @@ class SignalFusionEngine:
                         f"{s1} ({score1:+.2f}) contradicts {s2} ({score2:+.2f})"
                     )
         return contradictions
+
+    def compute_optimal_weights(
+        self,
+        conn,
+        market_type: Optional[str] = None,
+        lookback_days: int = 90,
+        min_samples: int = 20,
+    ) -> Dict:
+        """
+        Compute suggested weight adjustments from historical signal_accuracy data.
+
+        Uses inverse-Brier weighting: signals with lower average Brier score get
+        proportionally more weight. Falls back to the current WEIGHT_PROFILES default
+        if there is insufficient data.
+
+        Args:
+            conn:           Open DB connection.
+            market_type:    If given, tune weights for that profile only; otherwise
+                            returns a mapping of {market_type: weights}.
+            lookback_days:  How many days of history to include.
+            min_samples:    Minimum rows needed per signal to update its weight.
+
+        Returns:
+            dict with keys:
+              "profiles"    – {profile_key: {signal: weight, ...}} (normalized to sum=1)
+              "sample_counts" – {profile_key: {signal: n}}
+              "status"      – "updated" | "insufficient_data"
+        """
+        try:
+            from db import get_signal_brier_by_type
+        except ImportError:
+            return {"status": "insufficient_data", "profiles": {}, "sample_counts": {}}
+
+        signal_types = ["news", "sharp_trader", "base_rate", "cross_platform"]
+
+        # Which market types to process
+        if market_type:
+            profile_key = self._resolve_profile(market_type)
+            target_types = [profile_key]
+        else:
+            target_types = list(WEIGHT_PROFILES.keys())
+
+        profiles: Dict[str, Dict[str, float]] = {}
+        sample_counts: Dict[str, Dict[str, int]] = {}
+        any_updated = False
+
+        for mtype in target_types:
+            row = get_signal_brier_by_type(
+                conn, market_type=mtype, lookback_days=lookback_days
+            )
+            if not row or not row.get("n"):
+                continue
+
+            # row is a flat dict: {n, news_brier, sharp_brier, base_brier, xp_brier, ...}
+            n_total = row["n"]
+            # Map canonical signal names to their column names in the row
+            _col = {
+                "news": "news_brier",
+                "sharp_trader": "sharp_brier",
+                "base_rate": "base_brier",
+                "cross_platform": "xp_brier",
+            }
+            brier_map = {
+                sig: (row.get(col), n_total)
+                for sig, col in _col.items()
+            }
+
+            base = WEIGHT_PROFILES.get(mtype, WEIGHT_PROFILES["default"]).copy()
+            new_weights: Dict[str, float] = {}
+            counts: Dict[str, int] = {}
+
+            for sig in signal_types:
+                if sig in brier_map:
+                    avg_brier, n = brier_map[sig]
+                    if n >= min_samples and avg_brier is not None and avg_brier > 0:
+                        # Inverse-Brier: better signal → lower brier → higher weight
+                        new_weights[sig] = 1.0 / avg_brier
+                        counts[sig] = n
+                    else:
+                        # Insufficient data — keep base weight
+                        new_weights[sig] = base.get(sig, 0.10)
+                        counts[sig] = brier_map[sig][1] if sig in brier_map else 0
+                else:
+                    new_weights[sig] = base.get(sig, 0.10)
+                    counts[sig] = 0
+
+            # Keep MiroFish weight from base profile unchanged (not tracked separately)
+            new_weights["mirofish"] = base.get("mirofish", 0.20)
+
+            # Normalize so weights sum to 1.0
+            total = sum(new_weights.values())
+            if total > 0:
+                new_weights = {k: round(v / total, 4) for k, v in new_weights.items()}
+
+            profiles[mtype] = new_weights
+            sample_counts[mtype] = counts
+            any_updated = True
+
+        return {
+            "status": "updated" if any_updated else "insufficient_data",
+            "profiles": profiles,
+            "sample_counts": sample_counts,
+        }
 
 
 # ─── Smoke test ───────────────────────────────────────────────────────────────

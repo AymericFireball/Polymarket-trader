@@ -256,6 +256,46 @@ def init_db(db_path: str = DB_PATH):
     )
     """)
 
+    # ─── Signal accuracy feedback (for weight tuning) ───────────
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signal_accuracy (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        condition_id         TEXT NOT NULL,
+        prediction_id        TEXT,
+        market_type          TEXT,
+        resolution           TEXT NOT NULL,   -- "Yes" or "No"
+        actual               REAL NOT NULL,   -- 1.0 or 0.0
+        resolved_at          TEXT,
+
+        -- Per-signal scores and implied Brier at prediction time
+        news_score           REAL,
+        news_brier           REAL,
+        sharp_trader_score   REAL,
+        sharp_trader_brier   REAL,
+        base_rate_score      REAL,
+        base_rate_brier      REAL,
+        cross_platform_score REAL,
+        cross_platform_brier REAL,
+
+        -- Aggregate
+        our_estimate         REAL,
+        aggregate_brier      REAL,
+        market_brier         REAL,   -- (market_price - actual)^2 baseline
+
+        confidence           TEXT,
+        signal_count         INTEGER,
+        recorded_at          TEXT NOT NULL,
+
+        FOREIGN KEY (condition_id) REFERENCES markets(condition_id)
+    )
+    """)
+
+    # ─── Trades ledger — add is_paper for existing DBs ──────────
+    try:
+        cur.execute("ALTER TABLE trades ADD COLUMN is_paper INTEGER DEFAULT 0")
+    except Exception:
+        pass  # Column already exists
+
     # ─── Indexes ────────────────────────────────────────────────
     cur.execute("CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(active, closed)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_markets_type ON markets(market_type)")
@@ -267,6 +307,9 @@ def init_db(db_path: str = DB_PATH):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_cid ON trades(condition_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sharp_positions_cid ON sharp_positions(condition_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_pred ON signals_log(prediction_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_acc_cid ON signal_accuracy(condition_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_acc_type ON signal_accuracy(market_type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_paper ON trades(is_paper)")
 
     conn.commit()
     conn.close()
@@ -464,6 +507,86 @@ def db_stats(conn: sqlite3.Connection) -> Dict:
     stats["by_type"] = {r["market_type"]: r["cnt"] for r in types}
 
     return stats
+
+
+# ─── Signal accuracy ────────────────────────────────────────────
+
+def record_signal_accuracy(conn: sqlite3.Connection, condition_id: str,
+                           signals: Dict, resolution: str,
+                           prediction_id: str = None, market_type: str = None,
+                           our_estimate: float = None, market_price: float = None) -> None:
+    """
+    After a market resolves, record each signal's accuracy for weight tuning.
+    Signal scores are in [-1, +1]; we map to [0, 1] via p = 0.5 + score * 0.5.
+    """
+    actual = 1.0 if str(resolution).lower() in ("yes", "1", "true") else 0.0
+    now = datetime.now(timezone.utc).isoformat()
+
+    sig_types = ["news", "sharp_trader", "base_rate", "cross_platform"]
+    row: Dict[str, Any] = {
+        "condition_id": condition_id,
+        "prediction_id": prediction_id,
+        "market_type": market_type,
+        "resolution": resolution,
+        "actual": actual,
+        "our_estimate": our_estimate,
+        "aggregate_brier": (our_estimate - actual) ** 2 if our_estimate is not None else None,
+        "market_brier": (market_price - actual) ** 2 if market_price is not None else None,
+        "confidence": None,
+        "signal_count": 0,
+        "resolved_at": now,
+        "recorded_at": now,
+    }
+    for st in sig_types:
+        sig = (signals or {}).get(st) or {}
+        score = sig.get("score")
+        if score is not None:
+            prob = max(0.01, min(0.99, 0.5 + float(score) * 0.5))
+            row[f"{st}_score"] = float(score)
+            row[f"{st}_brier"] = (prob - actual) ** 2
+            row["signal_count"] = (row["signal_count"] or 0) + 1
+        else:
+            row[f"{st}_score"] = None
+            row[f"{st}_brier"] = None
+
+    conn.execute("""
+        INSERT INTO signal_accuracy (
+            condition_id, prediction_id, market_type, resolution, actual, resolved_at,
+            news_score, news_brier, sharp_trader_score, sharp_trader_brier,
+            base_rate_score, base_rate_brier, cross_platform_score, cross_platform_brier,
+            our_estimate, aggregate_brier, market_brier, confidence, signal_count, recorded_at
+        ) VALUES (
+            :condition_id, :prediction_id, :market_type, :resolution, :actual, :resolved_at,
+            :news_score, :news_brier, :sharp_trader_score, :sharp_trader_brier,
+            :base_rate_score, :base_rate_brier, :cross_platform_score, :cross_platform_brier,
+            :our_estimate, :aggregate_brier, :market_brier, :confidence, :signal_count, :recorded_at
+        )
+    """, row)
+
+
+def get_signal_brier_by_type(conn: sqlite3.Connection, market_type: str = None,
+                              lookback_days: int = None) -> Dict:
+    """Return avg Brier scores per signal type — used for weight tuning."""
+    conditions = ["actual IS NOT NULL"]
+    params: List = []
+    if market_type:
+        conditions.append("market_type = ?")
+        params.append(market_type)
+    if lookback_days:
+        conditions.append("recorded_at >= datetime('now', ?)")
+        params.append(f"-{lookback_days} days")
+    where = " AND ".join(conditions)
+    row = conn.execute(f"""
+        SELECT COUNT(*) as n,
+               AVG(news_brier)          as news_brier,
+               AVG(sharp_trader_brier)  as sharp_brier,
+               AVG(base_rate_brier)     as base_brier,
+               AVG(cross_platform_brier) as xp_brier,
+               AVG(aggregate_brier)     as agg_brier,
+               AVG(market_brier)        as market_brier
+        FROM signal_accuracy WHERE {where}
+    """, params).fetchone()
+    return dict(row) if row else {}
 
 
 # ─── Init on import ─────────────────────────────────────────────

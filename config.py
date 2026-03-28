@@ -78,3 +78,6 @@ PLATT_MIN_PREDICTIONS = 30      # Start Platt scaling after this many
 GATE_MIN_EDGE_CENTS = 5         # Minimum edge for pipeline to approve
 GATE_REQUIRE_SHARP = True       # Require sharp trader agreement
 GATE_MIN_CONFIDENCE = "medium"  # Minimum confidence level
+
+# ─── PAPER TRADING ───────────────────────────────────────────────
+PAPER_TRADE_MODE = False        # Set True to record paper trades instead of live orders
