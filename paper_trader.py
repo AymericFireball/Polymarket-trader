@@ -25,23 +25,40 @@ from pipeline import Pipeline, format_trade_signal
 
 # ─── Core session ─────────────────────────────────────────────────────────────
 
-def run_paper_session(top_n: int = 20, verbose: bool = False) -> Dict:
+def run_paper_session(top_n: int = 20, verbose: bool = False,
+                      market_keyword: Optional[str] = None,
+                      amount: Optional[float] = None) -> Dict:
     """
     Scan top_n markets through the full pipeline and paper-record every
     trade that would pass the DecisionGate.
+
+    If market_keyword is given, only that specific market is analyzed
+    (bypassing the DecisionGate — the trade is recorded regardless of edge).
+    amount overrides the automatic Kelly sizing.
 
     Returns a summary dict with keys: scanned, signals, recorded.
     """
     init_db()
     conn = get_conn()
 
-    markets = conn.execute("""
-        SELECT * FROM markets
-        WHERE resolved=0 AND yes_price IS NOT NULL
-          AND yes_price > 0.03 AND yes_price < 0.97
-        ORDER BY volume_24h DESC
-        LIMIT ?
-    """, (top_n,)).fetchall()
+    if market_keyword:
+        row = conn.execute(
+            "SELECT * FROM markets WHERE condition_id=?", (market_keyword,)
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM markets WHERE question LIKE ? AND resolved=0 LIMIT 1",
+                (f"%{market_keyword}%",)
+            ).fetchone()
+        markets = [row] if row else []
+    else:
+        markets = conn.execute("""
+            SELECT * FROM markets
+            WHERE resolved=0 AND yes_price IS NOT NULL
+              AND yes_price > 0.03 AND yes_price < 0.97
+            ORDER BY volume_24h DESC
+            LIMIT ?
+        """, (top_n,)).fetchall()
 
     pipeline = Pipeline()
     scanned = 0
@@ -59,7 +76,9 @@ def run_paper_session(top_n: int = 20, verbose: bool = False) -> Dict:
             continue
 
         decision = result.get("decision", {})
-        if not decision.get("pass"):
+        force = bool(market_keyword)  # skip gate for targeted trades
+
+        if not force and not decision.get("pass"):
             if verbose:
                 edge = decision.get("edge_cents", 0)
                 print(f"  SKIP  | {edge:3d}c | {market['question'][:55]}")
@@ -71,7 +90,7 @@ def run_paper_session(top_n: int = 20, verbose: bool = False) -> Dict:
 
         # Record the paper trade
         try:
-            _record_paper_trade(conn, market, result)
+            _record_paper_trade(conn, market, result, override_size=amount)
             recorded += 1
         except Exception as e:
             if verbose:
@@ -83,16 +102,20 @@ def run_paper_session(top_n: int = 20, verbose: bool = False) -> Dict:
     return {"scanned": scanned, "signals": signals, "recorded": recorded}
 
 
-def _record_paper_trade(conn, market: Dict, result: Dict) -> None:
+def _record_paper_trade(conn, market: Dict, result: Dict,
+                        override_size: Optional[float] = None) -> None:
     """Insert a paper trade row into the trades table."""
     decision = result.get("decision", {})
     side = decision.get("side", "YES")
     price = float(market.get("yes_price" if side == "YES" else "no_price") or 0.5)
     edge_cents = decision.get("edge_cents", 0)
 
-    # Half-Kelly sizing capped at 5% of bankroll for paper trades
-    max_size = BANKROLL * 0.05
-    size = min(max_size, max(1.0, edge_cents * 0.5))
+    if override_size is not None:
+        size = float(override_size)
+    else:
+        # Half-Kelly sizing capped at 5% of bankroll for paper trades
+        max_size = BANKROLL * 0.05
+        size = min(max_size, max(1.0, edge_cents * 0.5))
 
     now = datetime.now(timezone.utc).isoformat()
     trade_id = f"PT-{now[:10].replace('-','')}-{market['condition_id'][:8]}"

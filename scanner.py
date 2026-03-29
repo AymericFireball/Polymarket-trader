@@ -21,6 +21,8 @@ from risk_manager import RiskManager, PortfolioState
 from config import (
     MIN_LIQUIDITY_USD, MAX_DAYS_TO_RESOLUTION, MIN_VOLUME_24H,
     MIN_EDGE_CENTS, FOCUS_CATEGORIES, BANKROLL,
+    BLACKLIST_KEYWORDS, TIME_HORIZON_EDGE, TIME_HORIZON_CAPITAL_PCT,
+    MIN_PROBABILITY, MAX_PROBABILITY,
 )
 
 
@@ -98,12 +100,39 @@ class MarketScanner:
         self._print_results(scored)
         return scored
 
+    @staticmethod
+    def classify_time_horizon(days_to_resolution):
+        """Classify a market into short/medium/long based on days to resolution."""
+        if days_to_resolution is None:
+            return "medium"  # default if unknown
+        if days_to_resolution <= 7:
+            return "short"
+        elif days_to_resolution <= 30:
+            return "medium"
+        else:
+            return "long"
+
+    @staticmethod
+    def is_blacklisted(question: str) -> bool:
+        """Check if a market question contains blacklisted keywords."""
+        q_lower = question.lower()
+        return any(kw in q_lower for kw in BLACKLIST_KEYWORDS)
+
     def _filter_markets(self, markets: list, category_filter: str) -> list:
-        """Apply basic filters: volume, liquidity, time horizon, category."""
+        """Apply filters: volume, liquidity, time horizon, category, blacklist, probability."""
         filtered = []
+        rejected_blacklist = 0
+        rejected_probability = 0
+
         for m in markets:
             # Must be active and accepting orders
             if not m.get("active", False):
+                continue
+
+            # Blacklist filter — reject absurd/untradeable markets
+            question = m.get("question") or ""
+            if self.is_blacklisted(question):
+                rejected_blacklist += 1
                 continue
 
             # Volume filter
@@ -111,20 +140,35 @@ class MarketScanner:
             if vol_24h < MIN_VOLUME_24H:
                 continue
 
+            # Probability filter — skip extreme markets (< 3% or > 97%)
+            yes_price = None
+            if m.get("outcomePrices"):
+                try:
+                    yes_price = float(m["outcomePrices"].split(",")[0])
+                except (ValueError, IndexError):
+                    pass
+            if yes_price is not None:
+                if yes_price < MIN_PROBABILITY or yes_price > MAX_PROBABILITY:
+                    rejected_probability += 1
+                    continue
+
             # Time horizon filter
             end_date = m.get("endDate") or m.get("end_date_iso")
             dtl = days_until(end_date)
             if dtl is not None and dtl > MAX_DAYS_TO_RESOLUTION:
                 continue
 
+            # Tag the time horizon for downstream use
+            m["_time_horizon"] = self.classify_time_horizon(dtl)
+            m["_min_edge_cents"] = TIME_HORIZON_EDGE.get(m["_time_horizon"], MIN_EDGE_CENTS)
+
             # Category filter
             if category_filter:
                 tags = (m.get("tags") or []) + [m.get("category", "")]
                 tag_str = " ".join(str(t) for t in tags).lower()
                 if category_filter.lower() not in tag_str:
-                    # Also check question text
-                    question = (m.get("question") or "").lower()
-                    if category_filter.lower() not in question:
+                    q_lower = question.lower()
+                    if category_filter.lower() not in q_lower:
                         continue
 
             # Liquidity filter (use volume as proxy if liquidity not available)
@@ -133,6 +177,11 @@ class MarketScanner:
                 continue
 
             filtered.append(m)
+
+        if rejected_blacklist > 0:
+            print(f"       Rejected {rejected_blacklist} blacklisted markets")
+        if rejected_probability > 0:
+            print(f"       Rejected {rejected_probability} extreme-probability markets")
 
         # Sort by 24h volume descending
         filtered.sort(key=lambda x: float(x.get("volume24hr", 0) or 0), reverse=True)
@@ -345,9 +394,16 @@ class MarketScanner:
             size_usd = sizing.get("position_size_usd", 0)
             edge_c = sizing.get("edge_cents", 0)
 
+            # Time horizon info
+            horizon = m.get("_time_horizon", "?")
+            horizon_label = {"short": "SHORT", "medium": "MED", "long": "LONG"}.get(horizon, "?")
+            min_edge = m.get("_min_edge_cents", MIN_EDGE_CENTS)
+
             print(f"  #{i} [{grade}] {q}")
             print(f"      YES: ${yes_p:.2f} | Spread: {spread:.3f} | "
                   f"Vol 24h: ${vol:,.0f} | Depth: ${depth:,.0f} | Res: {dtl_str}")
+            print(f"      Horizon: {horizon_label} | Min edge: {min_edge}c | "
+                  f"Capital bucket: {TIME_HORIZON_CAPITAL_PCT.get(horizon, 0.20):.0%}")
             if size_usd > 0:
                 print(f"      Example (5c edge): ${size_usd:.0f} position | "
                       f"Side: {sizing.get('side', '?')}")

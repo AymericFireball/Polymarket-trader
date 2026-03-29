@@ -47,6 +47,39 @@ MIN_VOLUME_24H = 50            # Skip very low-volume markets
 # Which market categories to scan (empty = all)
 FOCUS_CATEGORIES = []  # e.g., ["politics", "crypto", "sports"]
 
+# ─── MARKET FILTERS ──────────────────────────────────────────────
+# Blacklisted keywords — markets containing these phrases are auto-rejected.
+# Case-insensitive substring match on the market question text.
+BLACKLIST_KEYWORDS = [
+    "jesus christ", "second coming", "rapture", "apocalypse",
+    "god will", "messiah return", "end of the world",
+    "alien invasion", "ufo disclosure", "flat earth",
+    "simulation theory", "time travel",
+]
+
+# Minimum edge by time horizon (longer bets need bigger edge to justify capital lockup)
+#   short  = resolves within 7 days  (e.g., tonight's NBA game)
+#   medium = resolves within 30 days
+#   long   = resolves within 90 days
+TIME_HORIZON_EDGE = {
+    "short":  5,   # 5c min edge  — fast turnover, lower bar
+    "medium": 7,   # 7c min edge  — moderate lockup
+    "long":  10,   # 10c min edge — long lockup needs bigger payoff
+}
+
+# Capital allocation by time horizon (% of deployable capital per bucket)
+# This prevents tying up all your money in long-dated bets
+TIME_HORIZON_CAPITAL_PCT = {
+    "short":  0.50,  # Up to 50% of deployable capital in short-term trades
+    "medium": 0.35,  # Up to 35% in medium-term
+    "long":   0.15,  # Only 15% in long-dated positions
+}
+
+# Minimum market probability for trade consideration
+# Markets below 3% or above 97% are usually noise
+MIN_PROBABILITY = 0.03
+MAX_PROBABILITY = 0.97
+
 # ─── NEWS API ─────────────────────────────────────────────────────
 # Get a free key at https://newsapi.org
 NEWSAPI_KEY = ""  # Your NewsAPI key
