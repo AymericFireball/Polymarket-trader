@@ -263,19 +263,63 @@ def get_category_stats() -> Dict[str, Dict]:
 def record_prediction(condition_id: str, calibrated_prob: float,
                       raw_probability: float = None,
                       model_version: str = "v1",
-                      signals_used: Dict = None) -> None:
+                      signals_used: Dict = None,
+                      question: str = None,
+                      market_price: float = None,
+                      confidence: str = None,
+                      recommended_side: str = None,
+                      kelly_fraction: float = None,
+                      recommended_size: float = None,
+                      actionable: bool = False,
+                      signal_bundle: Dict = None) -> None:
     """Record a prediction in the database for later calibration."""
+    delta = round(calibrated_prob - market_price, 4) if market_price is not None else None
+
+    # Extract per-signal fields from the full bundle for queryable columns
+    signals = signal_bundle.get("signals", {}) if signal_bundle else {}
+    news_s   = signals.get("news", {})
+    cross_s  = signals.get("cross_platform", {})
+    sharp_s  = signals.get("sharp_trader", {})
+    base_s   = signals.get("base_rate", {})
+
+    news_signal     = news_s.get("summary") or news_s.get("score")
+    cross_delta     = cross_s.get("delta") or cross_s.get("score")
+    sharp_consensus = sharp_s.get("consensus") or ("NONE" if sharp_s else None)
+    base_rate_val   = base_s.get("base_rate") or base_s.get("score")
+    key_drivers     = json.dumps(signal_bundle.get("key_drivers", [])) if signal_bundle else None
+    dissent_flag    = signal_bundle.get("strong_disagreement", False) if signal_bundle else False
+
     conn = get_conn()
     conn.execute("""
-        INSERT INTO predictions (condition_id, our_estimate,
-                                  sim_probability_raw, sim_probability_cal,
-                                  signal_bundle, predicted_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO predictions (
+            condition_id, question, market_price_at,
+            our_estimate, sim_probability_raw, sim_probability_cal,
+            delta, confidence, recommended_side, kelly_fraction,
+            recommended_size, actionable,
+            news_signal, cross_platform_delta, sharp_trader_consensus, base_rate,
+            key_drivers, dissent_flag,
+            signal_bundle, predicted_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         condition_id,
+        question,
+        market_price,
         calibrated_prob,
         raw_probability or calibrated_prob,
         calibrated_prob,
+        delta,
+        confidence,
+        recommended_side,
+        kelly_fraction,
+        recommended_size,
+        1 if actionable else 0,
+        str(news_signal) if news_signal is not None else None,
+        cross_delta,
+        sharp_consensus,
+        base_rate_val,
+        key_drivers,
+        1 if dissent_flag else 0,
         json.dumps(signals_used or {}),
         datetime.now(timezone.utc).isoformat(),
     ))

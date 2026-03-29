@@ -339,15 +339,32 @@ class Pipeline:
         result["decision"] = gate_result
         result["confidence_score"] = bundle.get("confidence_score", 0.5)
 
-        # Record prediction for calibration tracking
-        if gate_result.get("pass"):
-            try:
-                record_prediction(
-                    condition_id, calibrated, raw_prob,
-                    signals_used={k: v.get("score") for k, v in signals.items()}
-                )
-            except Exception:
-                pass  # Don't let DB errors block pipeline
+        # Record prediction for calibration tracking (always, not just on pass)
+        try:
+            trade_signal = gate_result.get("trade_signal") or {}
+            record_prediction(
+                condition_id=condition_id,
+                calibrated_prob=calibrated,
+                raw_probability=raw_prob,
+                signals_used={k: v.get("score") for k, v in signals.items()},
+                question=question,
+                market_price=market_price,
+                confidence=bundle.get("confidence"),
+                recommended_side=gate_result.get("side"),
+                kelly_fraction=trade_signal.get("kelly_fraction") or risk_check.get("kelly_fraction"),
+                recommended_size=trade_signal.get("position_size"),
+                actionable=gate_result.get("pass", False),
+                signal_bundle={
+                    "signals": signals,
+                    "key_drivers": bundle.get("key_drivers", []),
+                    "strong_disagreement": bundle.get("strong_disagreement", False),
+                    "contradictions": bundle.get("contradictions", []),
+                    "aggregate_score": bundle.get("aggregate_score"),
+                    "confidence_score": bundle.get("confidence_score"),
+                },
+            )
+        except Exception:
+            pass  # Don't let DB errors block pipeline
 
         return result
 
