@@ -82,7 +82,7 @@ MAX_PROBABILITY = 0.97
 
 # ─── NEWS API ─────────────────────────────────────────────────────
 # Get a free key at https://newsapi.org
-NEWSAPI_KEY = ""  # Your NewsAPI key
+NEWSAPI_KEY = "86817ffbfae549088f84f3e1bccb219c"
 
 # ─── POLYGONSCAN ──────────────────────────────────────────────────
 # Optional: for on-chain sharp trader queries
@@ -93,7 +93,10 @@ POLYGONSCAN_API_KEY = ""
 # MiroFish runs as a Docker container. Start with:
 #   cd mirofish-docker && docker compose up -d
 # Backend API runs on port 5001, UI on port 3000
+MIROFISH_ENABLED = False               # Set True to enable MiroFish (Phase 6+)
 MIROFISH_API_URL = "http://localhost:5001"  # MiroFish backend URL
+MIROFISH_NUM_AGENTS = 100              # Agents per simulation
+MIROFISH_NUM_ROUNDS = 2                # Simulation rounds
 
 # Legacy settings (kept for reference, Docker .env handles these now)
 MIROFISH_PATH = ""  # Not needed when using Docker
@@ -111,6 +114,20 @@ PLATT_MIN_PREDICTIONS = 30      # Start Platt scaling after this many
 GATE_MIN_EDGE_CENTS = 5         # Minimum edge for pipeline to approve
 GATE_REQUIRE_SHARP = True       # Require sharp trader agreement
 GATE_MIN_CONFIDENCE = "medium"  # Minimum confidence level
+
+# ─── TIME-HORIZON SIZING ─────────────────────────────────────────
+# Minimum edge (cents) required per time-horizon bucket
+TIME_HORIZON_EDGE = {
+    "short":  8,   # < 7 days  — need bigger edge for fast-moving markets
+    "medium": 5,   # 7–30 days — standard threshold
+    "long":   4,   # > 30 days — accept smaller edge for slow markets
+}
+# Max capital pct allowed per time-horizon bucket
+TIME_HORIZON_CAPITAL_PCT = {
+    "short":  0.05,
+    "medium": 0.10,
+    "long":   0.08,
+}
 
 # ─── PAPER TRADING ───────────────────────────────────────────────
 PAPER_TRADE_MODE = False        # Set True to record paper trades instead of live orders

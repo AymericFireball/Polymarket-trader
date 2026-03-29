@@ -55,6 +55,17 @@ class MarketScanner:
         self.client = PolymarketClient()
         self.risk_mgr = RiskManager(PortfolioState(bankroll=BANKROLL))
 
+    @staticmethod
+    def classify_time_horizon(days_to_resolution) -> str:
+        """Classify days-to-resolution into short/medium/long bucket."""
+        if days_to_resolution is None:
+            return "medium"
+        if days_to_resolution < 7:
+            return "short"
+        if days_to_resolution <= 30:
+            return "medium"
+        return "long"
+
     def scan(self, max_markets: int = 200, category_filter: str = "") -> List[Dict]:
         """
         Full market scan pipeline:

@@ -170,7 +170,8 @@ def cmd_scan(args):
 
         try:
             # Use market price as base, let signals adjust
-            result = pipeline.analyze_market(market, run_mirofish=getattr(args, "mirofish", False))
+            use_mirofish = getattr(args, "mirofish", False) and not getattr(args, "no_mirofish", False)
+            result = pipeline.analyze_market(market, run_mirofish=use_mirofish)
             results.append(result)
 
             d = result.get("decision", {})
@@ -1020,6 +1021,7 @@ Examples:
     scan_p.add_argument("--top", type=int, default=20, help="Number of markets to scan (default: 20)")
     scan_p.add_argument("--json", type=str, help="Save results to JSON file")
     scan_p.add_argument("--mirofish", "--run-mirofish", action="store_true", help="Run MiroFish simulation on each market")
+    scan_p.add_argument("--no-mirofish", dest="no_mirofish", action="store_true", help="Disable MiroFish (overrides config)")
 
     # analyze
     analyze_p = subs.add_parser("analyze", help="Deep analysis on a market")
