@@ -311,6 +311,36 @@ def init_db(db_path: str = DB_PATH):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sig_acc_type ON signal_accuracy(market_type)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_paper ON trades(is_paper)")
 
+    # ─── Weight overrides (live calibrated weights) ──────────────
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS weight_overrides (
+        market_type  TEXT NOT NULL,
+        signal       TEXT NOT NULL,
+        weight       REAL NOT NULL,
+        updated_at   TEXT NOT NULL,
+        run_id       TEXT,
+        PRIMARY KEY (market_type, signal)
+    )
+    """)
+
+    # ─── Weight calibration audit log ────────────────────────────
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS weight_calibration_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        TEXT NOT NULL,
+        run_at        TEXT NOT NULL,
+        market_type   TEXT NOT NULL,
+        signal        TEXT NOT NULL,
+        old_weight    REAL,
+        new_weight    REAL NOT NULL,
+        avg_brier     REAL,
+        sample_count  INTEGER,
+        lookback_days INTEGER
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_wcal_run ON weight_calibration_log(run_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_wcal_type ON weight_calibration_log(market_type)")
+
     conn.commit()
     conn.close()
     return db_path
@@ -587,6 +617,73 @@ def get_signal_brier_by_type(conn: sqlite3.Connection, market_type: str = None,
         FROM signal_accuracy WHERE {where}
     """, params).fetchone()
     return dict(row) if row else {}
+
+
+# ─── Weight calibration helpers ─────────────────────────────────
+
+def upsert_weight_overrides(conn: sqlite3.Connection, market_type: str,
+                            weights: Dict[str, float], run_id: str = None):
+    """Save calibrated weights for a market type (upsert per signal)."""
+    now = datetime.now(timezone.utc).isoformat()
+    for signal, weight in weights.items():
+        conn.execute("""
+        INSERT INTO weight_overrides (market_type, signal, weight, updated_at, run_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(market_type, signal) DO UPDATE SET
+            weight=excluded.weight, updated_at=excluded.updated_at, run_id=excluded.run_id
+        """, (market_type, signal, round(float(weight), 6), now, run_id))
+    conn.commit()
+
+
+def get_weight_overrides(conn: sqlite3.Connection) -> Dict[str, Dict[str, float]]:
+    """Return all active weight overrides as {market_type: {signal: weight}}."""
+    try:
+        rows = conn.execute(
+            "SELECT market_type, signal, weight FROM weight_overrides"
+        ).fetchall()
+        result: Dict[str, Dict[str, float]] = {}
+        for row in rows:
+            mt, sig, w = row[0], row[1], row[2]
+            result.setdefault(mt, {})[sig] = w
+        return result
+    except Exception:
+        return {}
+
+
+def log_weight_calibration(conn: sqlite3.Connection, run_id: str, market_type: str,
+                           signal: str, old_weight, new_weight: float,
+                           avg_brier, sample_count: int, lookback_days: int):
+    """Append one signal's weight change to the audit log."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+    INSERT INTO weight_calibration_log
+        (run_id, run_at, market_type, signal, old_weight, new_weight,
+         avg_brier, sample_count, lookback_days)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (run_id, now, market_type, signal,
+          float(old_weight) if old_weight is not None else None,
+          round(float(new_weight), 6),
+          float(avg_brier) if avg_brier is not None else None,
+          sample_count, lookback_days))
+    conn.commit()
+
+
+def get_weight_calibration_history(conn: sqlite3.Connection,
+                                   limit: int = 100) -> List[Dict]:
+    """Return recent weight calibration runs, newest first."""
+    try:
+        rows = conn.execute("""
+        SELECT run_id, run_at, market_type, signal,
+               old_weight, new_weight, avg_brier, sample_count
+        FROM weight_calibration_log
+        ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(zip(
+            ["run_id", "run_at", "market_type", "signal",
+             "old_weight", "new_weight", "avg_brier", "sample_count"], r
+        )) for r in rows]
+    except Exception:
+        return []
 
 
 # ─── Init on import ─────────────────────────────────────────────

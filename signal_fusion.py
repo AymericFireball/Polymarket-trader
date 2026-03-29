@@ -65,8 +65,42 @@ class SignalFusionEngine:
 
     Usage:
         engine = SignalFusionEngine()
+        engine.load_weights_from_db(conn)   # optional — loads calibrated weights
         bundle = engine.fuse(signals, market_type, mirofish_result, market_price)
     """
+
+    def __init__(self):
+        # Populated by load_weights_from_db(); overrides WEIGHT_PROFILES when set.
+        self._weight_overrides: Dict[str, Dict[str, float]] = {}
+
+    def load_weights_from_db(self, conn) -> None:
+        """
+        Load calibrated weight overrides from the DB into this engine instance.
+        Falls back to WEIGHT_PROFILES for any profile not in DB.
+        Call once after creating the engine so live weights are used.
+        """
+        try:
+            from db import get_weight_overrides
+            overrides = get_weight_overrides(conn)
+            self._weight_overrides = overrides
+        except Exception:
+            self._weight_overrides = {}
+
+    def _resolve_profile_weights(self, profile_key: str) -> Dict[str, float]:
+        """
+        Return weight dict for a profile.
+        DB overrides take precedence over WEIGHT_PROFILES hardcoded defaults.
+        """
+        base = WEIGHT_PROFILES.get(profile_key, WEIGHT_PROFILES["default"]).copy()
+        overrides = self._weight_overrides.get(profile_key)
+        if not overrides:
+            return base
+        # Merge: base provides all keys, DB overrides specific values
+        merged = {**base, **overrides}
+        total = sum(merged.values())
+        if total > 0:
+            merged = {k: round(v / total, 6) for k, v in merged.items()}
+        return merged
 
     def fuse(
         self,
@@ -89,7 +123,7 @@ class SignalFusionEngine:
             Full bundle dict compatible with DecisionGate and pipeline.py
         """
         profile_key = self._resolve_profile(market_type)
-        base_weights = WEIGHT_PROFILES[profile_key].copy()
+        base_weights = self._resolve_profile_weights(profile_key)
 
         signal_details: Dict[str, Dict] = {}
         scores_weighted: List[tuple] = []  # (score, effective_weight)

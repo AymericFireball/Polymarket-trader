@@ -23,6 +23,8 @@ Usage:
   python run.py tune-weights                   Update signal weights from accuracy history
   python run.py paper-trade [--top N]          Paper-trade session (no real orders)
   python run.py paper-report                   Report on paper-trade performance
+  python run.py auto-calibrate [--dry-run]     Auto-calibrate weights from resolved history
+  python run.py auto-calibrate --schedule      Print cron command for daily scheduling
 """
 
 import argparse
@@ -152,16 +154,23 @@ def cmd_scan(args):
 
         # Tag time horizon for edge threshold
         from scanner import MarketScanner
+        def _days_to(end_date_str):
+            try:
+                dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return (dt - datetime.now(timezone.utc)).days
+            except Exception:
+                return None
         dtl = MarketScanner.classify_time_horizon(
-            (datetime.fromisoformat(market["end_date"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).days
-            if market.get("end_date") else None
+            _days_to(market["end_date"]) if market.get("end_date") else None
         )
         market["_time_horizon"] = dtl
         market["_min_edge_cents"] = TIME_HORIZON_EDGE.get(dtl, 5)
 
         try:
             # Use market price as base, let signals adjust
-            result = pipeline.analyze_market(market)
+            result = pipeline.analyze_market(market, run_mirofish=getattr(args, "mirofish", False))
             results.append(result)
 
             d = result.get("decision", {})
@@ -699,6 +708,209 @@ def cmd_paper_report(args):
     print(paper_report(verbose=verbose))
 
 
+def _print_cron_setup():
+    """Print the cron command to schedule daily auto-calibration."""
+    script = os.path.abspath(os.path.join(os.path.dirname(__file__), "run.py"))
+    py = sys.executable
+    log = os.path.expanduser("~/polymarket-calibrate.log")
+    W = 68
+    print()
+    print("─" * W)
+    print("CRON SETUP — schedule daily auto-calibration at 3:00 AM")
+    print()
+    print("  Run: crontab -e  then add:")
+    print()
+    print(f"  0 3 * * *  cd {os.path.dirname(script)} && {py} run.py auto-calibrate >> {log} 2>&1")
+    print()
+    print("  Verify with: crontab -l")
+    print("─" * W)
+
+
+def cmd_auto_calibrate(args):
+    """
+    Auto-calibrate signal fusion weights from resolved prediction history.
+
+      1. Read per-signal Brier scores from signal_accuracy table
+      2. Show per-category breakdown (politics, crypto, sports, etc.)
+      3. Compute new weights via inverse-Brier weighting
+      4. Show before/after comparison for every profile
+      5. Write updated weights to weight_overrides + weight_calibration_log
+      6. Next pipeline run picks up new weights automatically
+    """
+    import uuid
+    from db import (
+        init_db, get_conn, get_signal_brier_by_type,
+        upsert_weight_overrides, log_weight_calibration, get_weight_overrides,
+    )
+    from signal_fusion import SignalFusionEngine, WEIGHT_PROFILES
+
+    lookback    = getattr(args, "lookback", 90)
+    min_samples = getattr(args, "min_samples", 20)
+    dry_run     = getattr(args, "dry_run", False)
+    schedule    = getattr(args, "schedule", False)
+
+    init_db()
+    conn   = get_conn()
+    run_id = str(uuid.uuid4())[:8]
+    W      = 68
+
+    print("=" * W)
+    print("AUTO-CALIBRATE: Adaptive Signal Weight Update")
+    print(f"  Run ID : {run_id}")
+    print(f"  Lookback: {lookback} days  |  Min samples: {min_samples}")
+    if dry_run:
+        print("  Mode   : DRY RUN (no DB writes)")
+    print("=" * W)
+
+    # ── Step 1: Overall Brier scores ──────────────────────────────
+    overall = get_signal_brier_by_type(conn, lookback_days=lookback)
+    n_total = overall.get("n", 0)
+
+    if n_total == 0:
+        print("\n  No resolved predictions in signal_accuracy yet.")
+        print("  Run: python run.py backtest --record")
+        print("  to populate accuracy data from resolved markets.\n")
+        if schedule:
+            _print_cron_setup()
+        conn.close()
+        return
+
+    # ── Step 2: Signal Brier score table ─────────────────────────
+    print(f"\nSIGNAL BRIER SCORES  (lower = better; random baseline = 0.25)\n")
+    mkt_brier = overall.get("market_brier") or 0.25
+
+    _SIGNAL_COLS = [
+        ("news",          "news_brier"),
+        ("sharp_trader",  "sharp_brier"),
+        ("base_rate",     "base_brier"),
+        ("cross_platform","xp_brier"),
+    ]
+    print(f"  {'Signal':<18}  {'Avg Brier':>9}  {'Skill vs mkt':>13}  {'n':>6}")
+    print(f"  {'-'*18}  {'-'*9}  {'-'*13}  {'-'*6}")
+    for name, col in _SIGNAL_COLS:
+        val = overall.get(col)
+        if val is not None:
+            skill = f"{(1 - val / mkt_brier) * 100:+.1f}%" if mkt_brier else "N/A"
+            print(f"  {name:<18}  {val:>9.4f}  {skill:>13}  {n_total:>6}")
+        else:
+            print(f"  {name:<18}  {'—':>9}  {'N/A':>13}  {n_total:>6}")
+
+    agg_brier = overall.get("agg_brier", 0.25)
+    skill_vs_mkt = (1 - agg_brier / mkt_brier) * 100 if mkt_brier else 0
+    print(f"\n  Fused aggregate : {agg_brier:.4f}")
+    print(f"  Market baseline : {mkt_brier:.4f}")
+    print(f"  Skill vs market : {skill_vs_mkt:+.1f}%")
+
+    # ── Step 3: Per-category breakdown ───────────────────────────
+    print(f"\n{'─'*W}")
+    print(f"PER-CATEGORY BREAKDOWN\n")
+    print(f"  {'Type':<14}  {'n':>5}  {'Fused Brier':>11}  {'Mkt Brier':>10}  {'Skill':>7}")
+    print(f"  {'-'*14}  {'-'*5}  {'-'*11}  {'-'*10}  {'-'*7}")
+
+    market_types = list(WEIGHT_PROFILES.keys())
+    type_brier: Dict[str, dict] = {}
+    for mt in market_types:
+        row = get_signal_brier_by_type(conn, market_type=mt, lookback_days=lookback)
+        n = row.get("n", 0)
+        if n > 0:
+            ab  = row.get("agg_brier",    0.25)
+            mb  = row.get("market_brier", 0.25) or 0.25
+            sk  = f"{(1 - ab / mb) * 100:+.1f}%" if mb else "N/A"
+            print(f"  {mt:<14}  {n:>5}  {ab:>11.4f}  {mb:>10.4f}  {sk:>7}")
+            type_brier[mt] = row
+
+    # ── Step 4: Compute new weights ───────────────────────────────
+    engine = SignalFusionEngine()
+    result = engine.compute_optimal_weights(
+        conn, lookback_days=lookback, min_samples=min_samples
+    )
+
+    if result["status"] == "insufficient_data":
+        print(f"\n  Insufficient data for weight update.")
+        print(f"  Need ≥{min_samples} samples per signal per category.")
+        print(f"  Tip: use --min-samples 5 while building history.")
+        if schedule:
+            _print_cron_setup()
+        conn.close()
+        return
+
+    # ── Step 5: Before/after comparison ──────────────────────────
+    new_profiles   = result["profiles"]
+    sample_counts  = result["sample_counts"]
+    existing       = get_weight_overrides(conn)
+
+    print(f"\n{'─'*W}")
+    print("WEIGHT UPDATES\n")
+
+    any_change = False
+    for profile_key, new_weights in new_profiles.items():
+        old_weights = existing.get(profile_key) or \
+                      WEIGHT_PROFILES.get(profile_key, WEIGHT_PROFILES["default"])
+
+        changed = [s for s in new_weights
+                   if abs(new_weights[s] - old_weights.get(s, 0)) > 0.005]
+        if not changed:
+            print(f"  [{profile_key.upper()}]  no significant changes")
+            continue
+
+        any_change = True
+        print(f"  [{profile_key.upper()}]")
+        print(f"  {'Signal':<18}  {'Old':>7}  {'New':>7}  {'Δ':>8}  {'n':>5}")
+        print(f"  {'-'*18}  {'-'*7}  {'-'*7}  {'-'*8}  {'-'*5}")
+        for sig in ["sharp_trader", "news", "base_rate", "cross_platform", "mirofish"]:
+            old_w = old_weights.get(sig, 0.0)
+            new_w = new_weights.get(sig, 0.0)
+            delta = new_w - old_w
+            n     = sample_counts.get(profile_key, {}).get(sig, 0)
+            arrow = "▲" if delta > 0.005 else ("▼" if delta < -0.005 else " ")
+            print(f"  {sig:<18}  {old_w:>7.4f}  {new_w:>7.4f}  {arrow}{abs(delta):>7.4f}  {n:>5}")
+        print()
+
+    if not any_change:
+        print("  All weight deltas < 0.5% — no update needed.\n")
+
+    # ── Step 6: Write to DB ───────────────────────────────────────
+    if not dry_run and any_change:
+        sig_brier_key = {
+            "news":          "news_brier",
+            "sharp_trader":  "sharp_brier",
+            "base_rate":     "base_brier",
+            "cross_platform":"xp_brier",
+            "mirofish":      None,
+        }
+        for profile_key, new_weights in new_profiles.items():
+            old_weights = existing.get(profile_key) or \
+                          WEIGHT_PROFILES.get(profile_key, WEIGHT_PROFILES["default"])
+            upsert_weight_overrides(conn, profile_key, new_weights, run_id)
+
+            cat_row = type_brier.get(profile_key) or \
+                      get_signal_brier_by_type(conn, market_type=profile_key,
+                                               lookback_days=lookback)
+            for sig, new_w in new_weights.items():
+                brier_col = sig_brier_key.get(sig)
+                log_weight_calibration(
+                    conn, run_id, profile_key, sig,
+                    old_weight   = old_weights.get(sig),
+                    new_weight   = new_w,
+                    avg_brier    = cat_row.get(brier_col) if brier_col else None,
+                    sample_count = sample_counts.get(profile_key, {}).get(sig, 0),
+                    lookback_days= lookback,
+                )
+
+        print(f"{'─'*W}")
+        print(f"  ✓  Weights saved (run_id={run_id}).")
+        print(f"     Changes take effect on next pipeline / scan run.")
+    elif dry_run:
+        print(f"{'─'*W}")
+        print(f"  DRY RUN — no changes written.\n")
+
+    # ── Step 7: Cron setup ────────────────────────────────────────
+    if schedule:
+        _print_cron_setup()
+
+    conn.close()
+
+
 def cmd_dashboard(args):
     """Launch the trading terminal dashboard."""
     from dashboard import main as dashboard_main
@@ -807,6 +1019,7 @@ Examples:
     scan_p = subs.add_parser("scan", help="Scan markets for trade signals")
     scan_p.add_argument("--top", type=int, default=20, help="Number of markets to scan (default: 20)")
     scan_p.add_argument("--json", type=str, help="Save results to JSON file")
+    scan_p.add_argument("--mirofish", "--run-mirofish", action="store_true", help="Run MiroFish simulation on each market")
 
     # analyze
     analyze_p = subs.add_parser("analyze", help="Deep analysis on a market")
@@ -877,6 +1090,18 @@ Examples:
     pr_p = subs.add_parser("paper-report", help="Paper-trading performance report")
     pr_p.add_argument("--verbose", action="store_true", help="Show individual trade details")
 
+    # auto-calibrate
+    ac_p = subs.add_parser("auto-calibrate",
+                           help="Calibrate signal weights from resolved prediction history")
+    ac_p.add_argument("--lookback",     type=int,  default=90,
+                      help="Days of history to use (default: 90)")
+    ac_p.add_argument("--min-samples",  type=int,  default=20,
+                      help="Min samples per signal before updating (default: 20)")
+    ac_p.add_argument("--dry-run",      action="store_true",
+                      help="Show proposed changes without writing to DB")
+    ac_p.add_argument("--schedule",     action="store_true",
+                      help="Print cron command for daily scheduling")
+
     # dashboard
     subs.add_parser("dashboard", help="Trading terminal dashboard")
 
@@ -901,6 +1126,7 @@ Examples:
         "tune-weights": cmd_tune_weights,
         "paper-trade": cmd_paper_trade,
         "paper-report": cmd_paper_report,
+        "auto-calibrate": cmd_auto_calibrate,
         "dashboard": cmd_dashboard,
     }
 

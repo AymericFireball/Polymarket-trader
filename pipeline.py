@@ -220,10 +220,14 @@ class Pipeline:
         )
         from signal_fusion import SignalFusionEngine
         self._fusion = SignalFusionEngine()
+        try:
+            self._fusion.load_weights_from_db(get_conn())
+        except Exception:
+            pass  # No DB weights yet — use hardcoded defaults
 
     def analyze_market(self, market: Dict,
                        my_probability: float = None,
-                       run_mirofish: bool = False) -> Dict:
+                       run_mirofish: bool = None) -> Dict:
         """
         Run full pipeline for a single market.
 
@@ -235,6 +239,13 @@ class Pipeline:
         Returns:
             Full analysis result with trade signal (if applicable)
         """
+        try:
+            from config import MIROFISH_ENABLED as _mf_enabled
+        except ImportError:
+            _mf_enabled = False
+        if run_mirofish is None:
+            run_mirofish = _mf_enabled
+
         question = market.get("question", "Unknown")
         market_price = market.get("yes_price") or market.get("outcomePrices") or 0.5
         if isinstance(market_price, str):
@@ -431,9 +442,13 @@ class Pipeline:
                     "base_rate": base_fmt,
                 }
             )
+            try:
+                from config import MIROFISH_NUM_AGENTS, MIROFISH_NUM_ROUNDS
+            except ImportError:
+                MIROFISH_NUM_AGENTS, MIROFISH_NUM_ROUNDS = 100, 2
             return run_mirofish_prediction(
                 market, context_text, market_type,
-                num_agents=500, num_rounds=5
+                num_agents=MIROFISH_NUM_AGENTS, num_rounds=MIROFISH_NUM_ROUNDS
             )
         except Exception as e:
             return {"status": "error", "sim_probability": None, "error": str(e)}
